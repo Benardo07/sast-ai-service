@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+import traceback
 
 from fastapi import FastAPI, HTTPException
 
@@ -53,6 +54,9 @@ async def load_release(body: LoadReleaseRequest) -> ActiveReleaseResponse:
             force_reload=body.force_reload,
         )
     except Exception as exc:
+        release_manager.remember_load_error(exc)
+        print("[sast-ai-service] load-release failed:")
+        print(traceback.format_exc())
         raise HTTPException(status_code=400, detail=str(exc))
     return ActiveReleaseResponse(**release_manager.active_release_payload())
 

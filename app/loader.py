@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sys
+import traceback
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -30,6 +31,14 @@ class ReleaseManager:
         self._predictor = None
         self._release: LoadedRelease | None = None
         self._load_error: str | None = None
+        self._load_traceback: str | None = None
+
+    def remember_load_error(self, exc: Exception) -> None:
+        with self._lock:
+            self._load_error = str(exc)
+            self._load_traceback = traceback.format_exc()
+            self._predictor = None
+            self._release = None
 
     def _ensure_source_repo_on_path(self) -> None:
         source_repo = settings.source_repo_path
@@ -126,6 +135,7 @@ class ReleaseManager:
             self._predictor = predictor
             self._release = release
             self._load_error = None
+            self._load_traceback = None
             self._persist_release(release)
             return release
 
@@ -150,6 +160,13 @@ class ReleaseManager:
                 "active_checkpoint_path": self._release.checkpoint_path,
                 "loaded_at": self._release.loaded_at,
                 "detail": None,
+            }
+
+    def load_error_payload(self) -> dict[str, Any]:
+        with self._lock:
+            return {
+                "error": self._load_error,
+                "traceback": self._load_traceback,
             }
 
     def active_release_payload(self) -> dict[str, Any]:
