@@ -1,14 +1,14 @@
 from __future__ import annotations
 
 import json
-import sys
 import traceback
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from threading import RLock
+from threading import RLock, Thread
 from typing import Any
 
+from app import storage
 from app.config import settings
 
 
@@ -40,16 +40,14 @@ class ReleaseManager:
             self._predictor = None
             self._release = None
 
-    def _ensure_source_repo_on_path(self) -> None:
-        source_repo = settings.source_repo_path
-        src_dir = source_repo / "src"
-        if not src_dir.exists():
-            raise FileNotFoundError(f"AI source repo src directory not found: {src_dir}")
-        src_dir_text = str(src_dir)
-        if src_dir_text not in sys.path:
-            sys.path.insert(0, src_dir_text)
-
     def _resolve_workspace_path(self, raw_path: str) -> Path:
+        # An s3:// pointer is pulled from object storage into the local cache (with its
+        # sibling config), so the service can serve a checkpoint it never trained.
+        if storage.is_s3_uri(raw_path):
+            path = storage.ensure_local(raw_path)
+            if not path.exists():
+                raise FileNotFoundError(f"Failed to materialize from object storage: {raw_path}")
+            return path
         path = Path(raw_path)
         if not path.is_absolute():
             path = (settings.workspace_root / raw_path).resolve()
@@ -68,7 +66,8 @@ class ReleaseManager:
         )
 
     def _load_config_summary(self, config_path: Path) -> dict[str, Any]:
-        self._ensure_source_repo_on_path()
+        # gnn_vuln is vendored into this service (top-level package), so it is
+        # imported directly — no dependency on the tugas-akhir repo at runtime.
         from gnn_vuln.config import Config
 
         cfg = Config.from_yaml(config_path)
@@ -87,7 +86,6 @@ class ReleaseManager:
         target.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
     def _load_predictor(self, checkpoint_path: Path, config_path: Path, device: str):
-        self._ensure_source_repo_on_path()
         from gnn_vuln.inference import VulnPredictor
 
         return VulnPredictor.from_checkpoint(
@@ -137,7 +135,18 @@ class ReleaseManager:
             self._load_error = None
             self._load_traceback = None
             self._persist_release(release)
+            # Warm up in the background: the node-LM (e.g. UniXcoder) is downloaded +
+            # initialized lazily on the first predict, which can take minutes. Trigger it
+            # now on a trivial function so the first REAL scan is fast (best-effort).
+            Thread(target=self._warmup, daemon=True).start()
             return release
+
+    def _warmup(self) -> None:
+        try:
+            if settings.joern_cli:
+                self.predict_from_code(code="int __warmup__(){return 0;}", top_k_lines=1, max_nodes=64)
+        except Exception:  # noqa: BLE001 - warmup is best-effort
+            pass
 
     def active_release(self) -> LoadedRelease | None:
         with self._lock:
@@ -212,6 +221,36 @@ class ReleaseManager:
             )
             if result is None:
                 raise RuntimeError("Prediction returned no result. CPG may be empty or exceed max_nodes.")
+            return {
+                "model_version_id": self._release.model_version_id,
+                "checkpoint_path": self._release.checkpoint_path,
+                "config_path": self._release.config_path,
+                "result": result,
+                "predicted_at": datetime.now(UTC),
+            }
+
+    def predict_from_code(
+        self,
+        *,
+        code: str,
+        top_k_lines: int | None,
+        max_nodes: int,
+    ) -> dict[str, Any]:
+        """Predict from a function source string — Joern CPG is built internally."""
+        with self._lock:
+            if self._release is None or self._predictor is None:
+                raise RuntimeError("No release loaded. Call /load-release first.")
+            joern = settings.joern_cli
+            if not joern:
+                raise RuntimeError("Joern is not configured (set SAST_AI_JOERN_CLI).")
+            result = self._predictor.predict_code(
+                code,
+                joern_cli=joern,
+                max_nodes=max_nodes,
+                top_k_lines=top_k_lines,
+            )
+            if result is None:
+                raise RuntimeError("Prediction returned no result. Joern produced no CPG (unparseable/empty function).")
             return {
                 "model_version_id": self._release.model_version_id,
                 "checkpoint_path": self._release.checkpoint_path,

@@ -14,6 +14,23 @@ class Settings(BaseSettings):
     active_release_file: str = "./var/active_release.json"
     default_device: str = "cpu"
     autoload_persisted_release: bool = False
+    # Relearn/training working dirs (relative paths resolve under service_root).
+    jobs_dir: str = "./var/jobs"
+    checkpoints_dir: str = "./var/checkpoints"
+    results_dir: str = "./var/results"
+    data_dir: str = "./var/data"
+    # Joern CLI dir for CPG generation (e.g. C:/joern/joern-cli). None = auto-detect.
+    joern_cli: str | None = None
+    # ── Artifact storage (production-ready: pull/push checkpoints from object storage) ──
+    # "fs" = local filesystem (dev); "s3" = MinIO/AWS via boto3 (prod, no shared disk).
+    storage_backend: str = "fs"
+    s3_endpoint: str = ""  # e.g. http://localhost:9000 for MinIO; blank = AWS default
+    s3_access_key: str = "minioadmin"
+    s3_secret_key: str = "minioadmin"
+    s3_region: str = "us-east-1"
+    s3_bucket_checkpoints: str = "checkpoints"
+    # Local cache for checkpoints downloaded from object storage.
+    checkpoint_cache_dir: str = "./var/checkpoint-cache"
 
     model_config = {
         "env_prefix": "SAST_AI_",
@@ -46,6 +63,32 @@ class Settings(BaseSettings):
         else:
             path = path.resolve()
         return path
+
+    def _resolve(self, raw: str) -> Path:
+        path = Path(raw)
+        if not path.is_absolute():
+            path = (self.service_root / path).resolve()
+        return path
+
+    @property
+    def jobs_root(self) -> Path:
+        return self._resolve(self.jobs_dir)
+
+    @property
+    def checkpoints_root(self) -> Path:
+        return self._resolve(self.checkpoints_dir)
+
+    @property
+    def results_root(self) -> Path:
+        return self._resolve(self.results_dir)
+
+    @property
+    def data_root(self) -> Path:
+        return self._resolve(self.data_dir)
+
+    @property
+    def checkpoint_cache_root(self) -> Path:
+        return self._resolve(self.checkpoint_cache_dir)
 
 
 settings = Settings()
