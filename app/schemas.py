@@ -22,6 +22,12 @@ class LoadReleaseRequest(BaseModel):
     force_reload: bool = False
 
 
+class ValidateModelRequest(BaseModel):
+    checkpoint_path: str
+    config_path: str | None = None
+    device: str | None = None
+
+
 class ActiveReleaseResponse(BaseModel):
     model_version_id: str | None = None
     checkpoint_path: str | None = None

@@ -14,6 +14,7 @@ from app.schemas import (
     ActiveReleaseResponse,
     HealthResponse,
     LoadReleaseRequest,
+    ValidateModelRequest,
     BuildCpgRequest,
     BuildCpgResponse,
     PredictRequest,
@@ -48,6 +49,20 @@ async def health() -> HealthResponse:
 @app.get("/release", response_model=ActiveReleaseResponse)
 async def active_release() -> ActiveReleaseResponse:
     return ActiveReleaseResponse(**release_manager.active_release_payload())
+
+
+@app.get("/runtimes")
+async def runtimes() -> dict:
+    """What this runtime can run — used by the platform's import compatibility check."""
+    return release_manager.runtimes_payload()
+
+
+@app.post("/validate-model")
+async def validate_model(body: ValidateModelRequest) -> dict:
+    """Dry-load a checkpoint+config (no side effects) to confirm gnn_vuln can run it."""
+    return release_manager.validate(
+        checkpoint_path=body.checkpoint_path, config_path=body.config_path, device=body.device,
+    )
 
 
 @app.post("/load-release", response_model=ActiveReleaseResponse)

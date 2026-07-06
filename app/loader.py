@@ -152,6 +152,45 @@ class ReleaseManager:
         with self._lock:
             return self._release
 
+    def validate(self, *, checkpoint_path: str, config_path: str | None, device: str | None = None) -> dict[str, Any]:
+        """Dry-load a checkpoint+config WITHOUT making it the active release, to verify the
+        in-house gnn_vuln runtime can actually run it (architecture supported by the registry
+        AND the weights load). Used by the platform's 'import managed model' validation."""
+        with self._lock:
+            resolved_ckpt = self._resolve_workspace_path(checkpoint_path)
+            resolved_cfg = (
+                self._resolve_workspace_path(config_path) if config_path else self._default_config_path(resolved_ckpt)
+            )
+            try:
+                summary = self._load_config_summary(resolved_cfg)
+            except Exception as e:  # noqa: BLE001
+                return {"compatible": False, "runtime": "gnn_vuln", "architecture": None,
+                        "num_classes": None, "error": f"config load failed: {type(e).__name__}: {e}"}
+            try:
+                self._load_predictor(resolved_ckpt, resolved_cfg, device or settings.default_device)
+            except Exception as e:  # noqa: BLE001
+                return {"compatible": False, "runtime": "gnn_vuln",
+                        "architecture": summary.get("architecture"), "num_classes": summary.get("num_classes"),
+                        "error": f"{type(e).__name__}: {e}"}
+            return {"compatible": True, "runtime": "gnn_vuln",
+                    "architecture": summary.get("architecture"), "num_classes": summary.get("num_classes"),
+                    "data_source": summary.get("data_source"), "data_mode": summary.get("data_mode"), "error": None}
+
+    @staticmethod
+    def runtimes_payload() -> dict[str, Any]:
+        """Advertise what this runtime can run (for the platform's import compatibility check)."""
+        try:
+            from gnn_vuln.models.registry import MODEL_REGISTRY
+            archs = sorted(MODEL_REGISTRY)
+        except Exception:  # noqa: BLE001
+            archs = []
+        try:
+            import gnn_vuln
+            version = getattr(gnn_vuln, "__version__", "unknown")
+        except Exception:  # noqa: BLE001
+            version = "unknown"
+        return {"runtime": "gnn_vuln", "version": version, "supported_architectures": archs}
+
     def health_payload(self) -> dict[str, Any]:
         with self._lock:
             if self._release is None:
