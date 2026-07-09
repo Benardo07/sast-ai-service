@@ -69,7 +69,6 @@ class LocalizationExtractor:
                 for _ in range(B):
                     loc_results.append(LocalizationMetrics.make_result([], [], []))
 
-        import numpy as np
         return (
             np.array(all_y),
             np.array(all_pred),

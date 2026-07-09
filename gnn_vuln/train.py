@@ -28,12 +28,11 @@ from gnn_vuln.data.dataset_lm import CodeBERTGraphDataset
 from gnn_vuln.losses import HierarchicalSupConLoss
 from gnn_vuln.models.registry import build_model, _parse_active_heads
 from gnn_vuln.training.ewc import EWCDR
-from gnn_vuln.training.losses import epoch_adaptive_class_weights, livable_loss as livable_real_loss
+from gnn_vuln.training.losses import epoch_adaptive_class_weights
 from gnn_vuln.training.optimizer import build_optimizer_and_scheduler
 from gnn_vuln.training.trainer import Trainer
 from gnn_vuln.utils import (
     set_seed, setup_logging, get_device,
-    save_checkpoint, load_resume_checkpoint, save_resume_checkpoint,
     CheckpointManager,
 )
 
@@ -90,6 +89,10 @@ class TrainingSession:
         paths = args.config if isinstance(args.config, (list, tuple)) else [args.config]
         cfg = (Config.from_yamls(paths)
                if all(Path(p).exists() for p in paths) else load_default_config())
+        if getattr(args, "seed", None) is not None:
+            cfg.train.seed = args.seed
+        if getattr(args, "split_seed", None) is not None:
+            cfg.data.split_seed = args.split_seed
         set_seed(cfg.train.seed, deterministic=getattr(cfg.train, "deterministic", False))
         setup_logging(cfg.train.log_dir)
         return cls(cfg, resume=getattr(args, "resume", False))
@@ -490,6 +493,7 @@ class TrainingSession:
             storage=getattr(cfg.data, "storage", "inmemory"),
             precompute_line_cls=getattr(cfg.model, "precompute_line_cls", False),
             ds_name_suffix=getattr(cfg.data, "ds_name_suffix", ""),
+            target_vocab=getattr(cfg.data, "target_vocab", None),
         )
         bs          = cfg.train.batch_size
         num_workers = getattr(cfg.train, "num_workers",    4)
@@ -576,7 +580,7 @@ class TrainingSession:
             train_idx, val_idx, test_idx = dataset.get_splits(
                 train_ratio=getattr(cfg.data, "train_ratio", 0.8),
                 val_ratio=getattr(cfg.data, "val_ratio", 0.1),
-                seed=cfg.train.seed,
+                seed=getattr(cfg.data, "split_seed", None) or cfg.train.seed,
             )
             if _use_balanced:
                 from gnn_vuln.training.sampler import SupConBalancedSampler
@@ -689,7 +693,7 @@ class TrainingSession:
         train_idx, _, _ = ds.get_splits(
             train_ratio=getattr(cfg.data, "train_ratio", 0.8),
             val_ratio=getattr(cfg.data, "val_ratio", 0.1),
-            seed=cfg.train.seed,
+            seed=getattr(cfg.data, "split_seed", None) or cfg.train.seed,
         )
         bpc = int(getattr(rcfg, "buffer_per_class", 0))
         if bpc > 0:
@@ -1007,6 +1011,10 @@ def main() -> None:
                              "files (e.g. data.yaml model.yaml train.yaml) merged in order.")
     parser.add_argument("--resume", action="store_true",
                         help="Resume from latest last_*.pt for this arch/mode.")
+    parser.add_argument("--seed", type=int, default=None,
+                        help="Override cfg.train.seed for multi-seed variance runs.")
+    parser.add_argument("--split-seed", type=int, default=None,
+                        help="Override the train/val/test split seed (keeps the split fixed while train.seed varies).")
     args = parser.parse_args()
 
     session = TrainingSession.from_args(args)

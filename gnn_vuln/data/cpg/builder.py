@@ -9,7 +9,7 @@ from torch_geometric.data import Data
 from gnn_vuln.data.node_embedder import LMNodeEmbedder
 from gnn_vuln.data.cpg.constants import EDGE_TYPES
 from gnn_vuln.data.cpg.features import (
-    _node_type_onehot, _edge_attr, _node_line, _node_end_line,
+    _node_type_onehot, _edge_attr, _node_line,
     _compute_distance_features, _dangerous_api_flags, _extra_node_features,
 )
 from gnn_vuln.data.cpg.parser import parse_cpg
@@ -75,8 +75,12 @@ def build_from_parsed(
     node_line  = torch.tensor(node_lines, dtype=torch.long)
     flaw_set   = set(flaw_lines) if flaw_lines else set()
 
+    # A node is a flaw statement if its own source line is a patch line. The
+    # METHOD node is excluded: in MegaVul CPGs it is the only node with a
+    # lineNumberEnd (spanning the whole function), and matching it would mark
+    # line 1 (the signature) as a flaw in almost every vulnerable function.
     flaw_line_mask = torch.tensor(
-        [1 if (ln >= 0 and any(ln <= fl <= max(ln, _node_end_line(n)) for fl in flaw_set))
+        [1 if (ln >= 0 and n.get("labelV") != "METHOD" and ln in flaw_set)
          else 0
          for ln, n in zip(node_lines, nodes)],
         dtype=torch.long,

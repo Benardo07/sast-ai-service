@@ -7,8 +7,6 @@ from torch_geometric.nn import GATv2Conv
 from torch_geometric.nn import global_mean_pool
 from gnn_vuln.models.base import VulnDetectorBase
 from gnn_vuln.models.heads import StmtHead, MTLHeads
-from gnn_vuln.models._lm_utils import lm_hidden_dim, lm_pool
-from transformers import AutoConfig, AutoModel
 
 NODE_FEAT_DIM = 773
 EDGE_FEAT_DIM = 7

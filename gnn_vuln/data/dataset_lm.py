@@ -61,8 +61,8 @@ from tqdm import tqdm
 from gnn_vuln.data.graph_builder_lm import build_from_parsed, build_func_text, parse_cpg
 from gnn_vuln.data.cpg.parser import parse_cpg_hdf5_group
 from gnn_vuln.data.cwe_taxonomy import (
-    CWE_GROUP_MAP, GROUP_VOCAB, _GROUP_TO_CWES, _expand_cwe_filter,
-    OWASP_GROUP_MAP, OWASP_VOCAB, OWASP_LABELS, _OWASP_TO_CWES,
+    CWE_GROUP_MAP, GROUP_VOCAB, _expand_cwe_filter,
+    OWASP_GROUP_MAP, OWASP_VOCAB,
 )
 from gnn_vuln.data.node_embedder import LMNodeEmbedder
 
@@ -380,12 +380,14 @@ class CodeBERTGraphDataset(Dataset):
         storage: str = "inmemory",  # "inmemory" | "lazy"
         precompute_line_cls: bool = False,
         ds_name_suffix: str = "",   # graph_vit: load a separate patched .pt
+        target_vocab: dict | None = None,   # CL: remap labels onto this canonical vocab at load
         transform=None,
         pre_transform=None,
     ):
         self._force_rebuild = force_rebuild
         self._storage = storage  # "inmemory" | "lazy"
         self._ds_name_suffix = ds_name_suffix
+        self._target_vocab = target_vocab
         self._precompute_line_cls = precompute_line_cls
         self._func_max_length = func_max_length
         self.max_nodes = max_nodes
@@ -437,6 +439,34 @@ class CodeBERTGraphDataset(Dataset):
         self.class_names = _loaded.get("class_names")
         self._graphs: list | None = _loaded.get("graphs") if self._storage == "inmemory" else None
         self.raw_funcs = None  # access per-sample via dataset[i].raw_func
+        self._label_remap = self._build_label_remap()
+
+    def _build_label_remap(self):
+        """If target_vocab is set, return a [own_num_classes] long tensor mapping this dataset's
+        OWN class id -> the target vocab id (matched by CWE name), and reorder self.class_names
+        into the target order. Aligns a task-B dataset onto a base model's class space: known
+        CWEs keep their canonical id, new CWEs land on the extended ids. None when unset."""
+        tv = self._target_vocab
+        if not tv or not self.class_names:
+            return None
+        missing = [n for n in self.class_names if n not in tv]
+        if missing:
+            raise ValueError(f"target_vocab is missing classes present in the dataset: {missing}")
+        remap = torch.tensor([int(tv[n]) for n in self.class_names], dtype=torch.long)
+        ordered: list = [None] * (max(int(v) for v in tv.values()) + 1)
+        for name, idx in tv.items():
+            if 0 <= int(idx) < len(ordered):
+                ordered[int(idx)] = name
+        self.class_names = [n if n is not None else f"class_{i}" for i, n in enumerate(ordered)]
+        return remap
+
+    def _apply_label_remap(self, g, *, clone: bool):
+        if self._label_remap is None:
+            return g
+        if clone:
+            g = g.clone()
+        g.y = self._label_remap[g.y.view(-1)].view_as(g.y)
+        return g
 
     # ------------------------------------------------------------------
     # PyG hooks
@@ -1563,7 +1593,7 @@ class CodeBERTGraphDataset(Dataset):
 
     def get(self, idx: int) -> Data:
         if self._storage == "inmemory":
-            return self._graphs[idx]
+            return self._apply_label_remap(self._graphs[idx], clone=True)
         _path = self._graphs_dir / f"{idx}.pt"
         # Files are valid on disk (verified), but concurrent multi-worker reads on
         # overlay/network filesystems can intermittently return truncated data
@@ -1590,21 +1620,26 @@ class CodeBERTGraphDataset(Dataset):
             )
         ):
             g = self._patch_func_token_lines(g, idx)
-        return g
+        return self._apply_label_remap(g, clone=False)
 
     def get_all_labels(self) -> torch.Tensor:
         """Return [N] long tensor of all labels. Fast path for class-weight setup."""
         if self._storage == "inmemory" and self._graphs is not None:
-            return torch.stack([g.y for g in self._graphs]).squeeze(-1).long()
-        labels_cache = self._graphs_dir / "_labels.pt"
-        if labels_cache.exists():
-            return torch.load(labels_cache, weights_only=True).long()
-        labels = torch.tensor(
-            [torch.load(self._graphs_dir / f"{i}.pt", weights_only=False).y.item()
-             for i in range(self._n_graphs)],
-            dtype=torch.long,
-        )
-        torch.save(labels, labels_cache)
+            labels = torch.stack([g.y for g in self._graphs]).squeeze(-1).long()
+        else:
+            labels_cache = self._graphs_dir / "_labels.pt"
+            if labels_cache.exists():
+                labels = torch.load(labels_cache, weights_only=True).long()
+            else:
+                labels = torch.tensor(
+                    [torch.load(self._graphs_dir / f"{i}.pt", weights_only=False).y.item()
+                     for i in range(self._n_graphs)],
+                    dtype=torch.long,
+                )
+                torch.save(labels, labels_cache)
+        # the cache stays in the dataset's OWN label space (target-independent); remap on read.
+        if self._label_remap is not None:
+            labels = self._label_remap[labels]
         return labels
 
     @property

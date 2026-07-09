@@ -5,7 +5,7 @@ import torch.nn as nn
 from torch_geometric.nn import global_mean_pool
 from gnn_vuln.models.base import VulnDetectorBase
 from gnn_vuln.models.encoders import GATEncoder
-from gnn_vuln.models.heads import SmallFuncHead, FuncHead, StmtHead
+from gnn_vuln.models.heads import SmallFuncHead, StmtHead
 
 NODE_FEAT_DIM = 773
 

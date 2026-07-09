@@ -674,10 +674,13 @@ class Trainer:
         all_labels = torch.cat(labels_buf).cpu().tolist()
         n          = len(all_labels)
         avg = "binary" if is_binary else "macro"
-        f1_macro         = f1_score(all_labels, all_preds, average=avg,        zero_division=0)
+        # macro averages over classes PRESENT in y_true, not unique(y_true ∪ y_pred) — keeps the
+        # val-F1 early-stopping signal independent of stray predictions into 0-support classes.
+        macro_labels = None if is_binary else np.unique(all_labels)
+        f1_macro         = f1_score(all_labels, all_preds, average=avg, labels=macro_labels, zero_division=0)
         f1_weighted      = f1_score(all_labels, all_preds, average="weighted",  zero_division=0)
-        precision_main   = precision_score(all_labels, all_preds, average=avg,        zero_division=0)
-        recall_main      = recall_score(all_labels, all_preds, average=avg,           zero_division=0)
+        precision_main   = precision_score(all_labels, all_preds, average=avg, labels=macro_labels, zero_division=0)
+        recall_main      = recall_score(all_labels, all_preds, average=avg, labels=macro_labels, zero_division=0)
         precision_w      = precision_score(all_labels, all_preds, average="weighted", zero_division=0)
         recall_w         = recall_score(all_labels, all_preds, average="weighted",    zero_division=0)
         acc = float(np.mean(np.array(all_preds) == np.array(all_labels)))

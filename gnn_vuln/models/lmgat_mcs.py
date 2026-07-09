@@ -1,8 +1,6 @@
 """lmgat_mcs.py — Arch4: GATv2Conv + live LM + multiclass statement head."""
 from __future__ import annotations
 import torch
-import torch.nn as nn
-from torch_geometric.nn import global_mean_pool
 from gnn_vuln.models.base import VulnDetectorBase
 from gnn_vuln.models.encoders import GATEncoder
 from gnn_vuln.models.heads import FuncHead, MulticlassStmtHead

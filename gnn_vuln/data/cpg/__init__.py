@@ -4,7 +4,6 @@ from gnn_vuln.data.cpg.constants import (
     EDGE_TYPES,
     EDGE_TYPE_TO_IDX,
     DANGEROUS_APIS,
-    _check_enum,
 )
 from gnn_vuln.data.cpg.parser import (
     _parse_graphml,

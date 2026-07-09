@@ -124,11 +124,15 @@ class Evaluator:
 
     def _function_level(self, y_true, y_pred, y_prob, confidence, correct_mask, target_names) -> dict:
         n_classes = y_prob.shape[1]
+        # macro metrics average over classes PRESENT in y_true (F1 is undefined for a class with
+        # no test samples). Passing labels= makes the denominator independent of what the model
+        # predicts — without it sklearn averages over unique(y_true ∪ y_pred), which silently
+        # includes a 0-support class as F1=0 the moment the model emits one stray prediction for it.
+        present = np.unique(y_true)
         try:
             if n_classes == 2:
                 auc_roc = roc_auc_score(y_true, y_prob[:, 1])
             else:
-                present = np.unique(y_true)
                 y_p = y_prob[:, present]
                 y_p = y_p / y_p.sum(axis=1, keepdims=True)
                 auc_roc = roc_auc_score(y_true, y_p, multi_class="ovr",
@@ -138,7 +142,7 @@ class Evaluator:
 
         return {
             "accuracy": float((y_true == y_pred).mean()),
-            "f1_macro": f1_score(y_true, y_pred, average="macro", zero_division=0),
+            "f1_macro": f1_score(y_true, y_pred, average="macro", labels=present, zero_division=0),
             "f1_weighted": f1_score(y_true, y_pred, average="weighted", zero_division=0),
             "auc_roc_macro_ovr": auc_roc,
             "confidence_mean":    float(confidence.mean()),
@@ -203,12 +207,24 @@ class Evaluator:
                 print(f"    [{marker}] line {ln:4d} score={sc:.3f}  {code[:60]}")
             shown += 1
 
-    def _get_src_lines(self, func_idx: int) -> list[str]:
-        if self.raw_funcs is None:
-            return []
+    def _get_src(self, func_idx: int) -> tuple[list[str], int]:
+        """Source lines + parquet_id for a test function. Reads raw_func/parquet_id
+        per-sample off the graph so it works for lazy storage too — the inmem-only
+        raw_funcs list is used as a fallback when the graph lacks raw_func."""
         ds_idx = self.test_idx[func_idx]
-        raw = self.raw_funcs[ds_idx] if ds_idx < len(self.raw_funcs) else ""
-        return raw.splitlines() if raw else []
+        g = self.dataset[ds_idx]
+        raw = getattr(g, "raw_func", "") or ""
+        if not raw and self.raw_funcs is not None:
+            raw = self.raw_funcs[ds_idx] if ds_idx < len(self.raw_funcs) else ""
+        pid = getattr(g, "parquet_id", None)
+        try:
+            pid = int(pid.item()) if hasattr(pid, "item") else int(pid)
+        except (TypeError, ValueError):
+            pid = -1
+        return (raw.splitlines() if raw else []), pid
+
+    def _get_src_lines(self, func_idx: int) -> list[str]:
+        return self._get_src(func_idx)[0]
 
     # ------------------------------------------------------------------
     # Save outputs
@@ -253,8 +269,13 @@ class Evaluator:
         rd.mkdir(parents=True, exist_ok=True)
         y_true, y_pred, y_prob, target_names = res.y_true, res.y_pred, res.y_prob, res.target_names
 
+        # per-test-func (src_lines, parquet_id) — one graph load each, reused by both CSVs so
+        # every row traces back to the exact source (code) + parquet row (parquet_id).
+        src_cache = [self._get_src(i) for i in range(len(y_true))]
+
         # predictions.csv
-        pred_df = pd.DataFrame({"y_true": y_true, "y_pred": y_pred,
+        pred_df = pd.DataFrame({"parquet_id": [c[1] for c in src_cache],
+                                 "y_true": y_true, "y_pred": y_pred,
                                  "confidence": res.confidence, "correct": res.correct_mask})
         for i, name in enumerate(target_names):
             pred_df[f"prob_{name}"] = y_prob[:, i]
@@ -264,10 +285,11 @@ class Evaluator:
         # localization_scores.csv
         loc_rows: list[dict] = []
         for func_idx, (r, yt, yp) in enumerate(zip(res.loc_results, y_true, y_pred)):
-            src_lines = self._get_src_lines(func_idx)
+            src_lines, pid = src_cache[func_idx]
             for ln, sc, lab in zip(r["line_numbers"], r["line_scores"], r["line_labels"]):
                 code = src_lines[ln - 1].strip() if 0 < ln <= len(src_lines) else ""
-                loc_rows.append({"func_idx": func_idx, "y_true": int(yt), "y_pred": int(yp),
+                loc_rows.append({"func_idx": func_idx, "parquet_id": pid,
+                                  "y_true": int(yt), "y_pred": int(yp),
                                   "line_number": int(ln), "score": round(float(sc), 6),
                                   "is_flaw_line": int(lab), "code": code})
         if loc_rows:
@@ -324,12 +346,20 @@ def main() -> None:
     parser.add_argument("--config", default=None, help="Config YAML (auto-detected if omitted)")
     parser.add_argument("--metrics-only", action="store_true",
                         help="Write only metrics_summary.json, skip per-sample CSVs + plots (API path).")
+    parser.add_argument("--seed", type=int, default=None,
+                        help="Override cfg.train.seed to match a multi-seed run's split.")
+    parser.add_argument("--split-seed", type=int, default=None,
+                        help="Override the split seed to match the model's training split.")
     args = parser.parse_args()
 
     config_path = Path(args.config) if args.config else Path(args.checkpoint).parent / "config.yaml"
     cfg = Config.from_yaml(config_path) if config_path.exists() else load_default_config()
     if not (args.config or config_path.exists()):
         logger.warning("No config.yaml found, using defaults.")
+    if args.seed is not None:
+        cfg.train.seed = args.seed
+    if args.split_seed is not None:
+        cfg.data.split_seed = args.split_seed
 
     setup_logging(cfg.train.log_dir)
     device = get_device(cfg.train.device)
@@ -346,6 +376,7 @@ def main() -> None:
         embedder_device=cfg.train.device,
         mode=cfg.data.mode,
         source=getattr(cfg.data, "source", "bigvul"),
+        target_vocab=getattr(cfg.data, "target_vocab", None),
         pretrained_lm=pretrained_lm,
         func_lm=func_lm,
         add_func_tokens=add_func_tokens,
@@ -364,8 +395,11 @@ def main() -> None:
     _, _, test_idx = dataset.get_splits(
         train_ratio=getattr(cfg.data, "train_ratio", 0.8),
         val_ratio=getattr(cfg.data, "val_ratio", 0.1),
-        seed=cfg.train.seed,
+        seed=getattr(cfg.data, "split_seed", None) or cfg.train.seed,
     )
+    if not test_idx:
+        logger.info("Empty test split (train_ratio + val_ratio = 1.0) — evaluation skipped (prod 90/10/0).")
+        return
 
     in_channels = dataset[0].x.size(1)
     model = build_model(cfg, in_channels).to(device)

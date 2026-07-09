@@ -4,7 +4,7 @@ from __future__ import annotations
 import logging
 import re
 
-from gnn_vuln.data.node_embedder import NODE_TYPES, NODE_TYPE_TO_IDX
+from gnn_vuln.data.node_embedder import NODE_TYPES
 
 _log = logging.getLogger(__name__)
 _unknown_enum_seen: set[str] = set()

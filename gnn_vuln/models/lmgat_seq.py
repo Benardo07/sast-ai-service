@@ -2,8 +2,7 @@
 from __future__ import annotations
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from torch_geometric.nn import global_add_pool, global_mean_pool
+from torch_geometric.nn import global_add_pool
 from gnn_vuln.models.base import VulnDetectorBase
 from gnn_vuln.models.encoders import GATEncoder
 from gnn_vuln.models.heads import FuncHead, StmtHead

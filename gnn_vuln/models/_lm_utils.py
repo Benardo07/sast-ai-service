@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import torch
-from loguru import logger
 
 
 def _is_codet5p_embedding(model) -> bool:

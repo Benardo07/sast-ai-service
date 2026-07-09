@@ -22,7 +22,7 @@ Usage
 
     print(result["prediction"])          # "CWE-119"
     print(result["confidence"])          # 0.87
-    print(result["suspicious_lines"])    # [{"line": 14, "score": 0.92}, ...]
+    print(result["suspicious_lines"])    # [{"line": 14, "statement": "strcpy(dst, src);", "score": 0.92}, ...]
 
 Output schema
 -------------
@@ -39,6 +39,9 @@ Output schema
     "suspicious_lines": [       — statements ranked by vulnerability score, descending
         {
             "line":       int,
+            "statement":  str,    — source of the statement at that line (spans
+                                    continuation lines of a multi-line statement);
+                                    null if the source is unavailable
             "score":      float,  — vulnerability score [0,1]; higher = more suspicious
             # Only present for lmgat_mcs (multiclass statement head):
             "predicted_cwe":        str,
@@ -206,6 +209,21 @@ def predict(
     # ── Statement-level result ───────────────────────────────────────────────
     suspicious_lines: list[dict] = []
 
+    # Source lines, so each suspicious line can carry the statement it refers to.
+    raw_func = getattr(data, "raw_func", None)
+    src_lines = str(raw_func).split("\n") if raw_func else None
+
+    def _statement_text(line: int, node_lines_sorted: list[int]) -> Optional[str]:
+        """Full source of the statement at `line`, spanning any continuation lines
+        up to the next statement (multi-line calls, conditions, split strings)."""
+        if not src_lines or line < 1 or line > len(src_lines):
+            return None
+        nxt = next((l for l in node_lines_sorted if l > line), len(src_lines) + 1)
+        span = src_lines[line - 1:nxt - 1]
+        while span and not span[-1].strip():
+            span.pop()
+        return "\n".join(span).strip() or None
+
     if stmt_scores_list is not None and node_line is not None:
         scores_raw = stmt_scores_list[0]   # tensor for graph 0
 
@@ -233,6 +251,7 @@ def predict(
                 stmt_class_id = int(sp.argmax().item())
                 stmt_entry = {
                     "line": int(line),
+                    "statement": _statement_text(int(line), unique_lines),
                     "score": round(float(score), 6),
                     "predicted_cwe": (
                         class_names[stmt_class_id]
@@ -262,7 +281,11 @@ def predict(
                 entries = entries[:top_k_lines]
 
             suspicious_lines = [
-                {"line": int(ln), "score": round(float(sc), 6)}
+                {
+                    "line": int(ln),
+                    "statement": _statement_text(int(ln), unique_lines),
+                    "score": round(float(sc), 6),
+                }
                 for ln, sc in entries
             ]
 

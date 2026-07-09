@@ -9,7 +9,7 @@ from torch_geometric.nn import (
     GATv2Conv, GCNConv, GINEConv, GatedGraphConv, RGCNConv, ResGatedGraphConv,
 )
 from torch_geometric.nn.norm import GraphNorm
-from torch_geometric.utils import degree, to_torch_csr_tensor
+from torch_geometric.utils import degree
 
 
 def _compute_rwse(edge_index: torch.Tensor, num_nodes: int, walk_length: int = 16) -> torch.Tensor:
