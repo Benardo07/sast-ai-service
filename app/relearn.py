@@ -114,6 +114,7 @@ class RelearnManager:
         num_classes: int | None,
         epochs: int | None,
         base_checkpoint_path: str | None,
+        base_class_names: list[str] | None,
         replay_source: str | None,
         device: str | None,
         job_dir: Path,
@@ -136,6 +137,20 @@ class RelearnManager:
         # (otherwise it falls back to its own ./checkpoints and the result is "not found").
         cfg.setdefault("train", {})["checkpoint_dir"] = str(settings.checkpoints_root)
         cfg["train"]["results_dir"] = str(settings.results_root)
+
+        # Continual-learning label alignment: when continuing a base model, remap task-B labels
+        # onto the base model's class space so ids never clash. Known CWEs keep their canonical
+        # id; brand-new CWEs (class-incremental) extend the head and num_classes grows to fit.
+        # gnn_vuln applies the remap at load via data.target_vocab. retrain (no base) skips this.
+        if method != "retrain" and base_class_names and materialized:
+            tv = {name: i for i, name in enumerate(base_class_names)}
+            vpath = settings.data_root / "raw" / data_source / "cwe_vocab.json"
+            if vpath.exists():
+                for name in json.loads(vpath.read_text(encoding="utf-8")):
+                    if name not in tv:
+                        tv[name] = len(tv)          # new CWE -> extended id (head grows)
+            cfg["data"]["target_vocab"] = tv
+            cfg.setdefault("model", {})["num_classes"] = len(tv)
 
         cfg.pop("ewc", None)
         cfg.pop("replay", None)
@@ -401,6 +416,7 @@ class RelearnManager:
         num_classes: int | None = None,
         epochs: int | None = None,
         base_checkpoint_path: str | None = None,
+        base_class_names: list[str] | None = None,
         replay_source: str | None = None,
         device: str | None = None,
         model_version_id: str | None = None,
@@ -460,6 +476,7 @@ class RelearnManager:
             num_classes=num_classes,
             epochs=epochs,
             base_checkpoint_path=base_checkpoint_path,
+            base_class_names=base_class_names,
             replay_source=replay_source,
             device=device,
             job_dir=job_dir,

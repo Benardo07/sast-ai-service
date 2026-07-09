@@ -122,6 +122,7 @@ async def relearn(body: RelearnRequest) -> RelearnJobOut:
             num_classes=body.num_classes,
             epochs=body.epochs,
             base_checkpoint_path=body.base_checkpoint_path,
+            base_class_names=body.base_class_names,
             replay_source=body.replay_source,
             device=body.device,
             model_version_id=body.model_version_id,

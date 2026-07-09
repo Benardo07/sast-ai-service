@@ -82,6 +82,7 @@ class RelearnRequest(BaseModel):
     num_classes: int | None = None
     epochs: int | None = None
     base_checkpoint_path: str | None = Field(None, description="Task-A checkpoint (.pt) for finetune/EWC/ER/EWC-ER")
+    base_class_names: list[str] | None = Field(None, description="Base model's ordered class names. When continuing a base model, task-B labels are remapped onto this class space (known CWEs keep their id, new CWEs extend the head).")
     replay_source: str | None = Field(None, description="Task-A data source for replay / EWC importance")
     device: str | None = None
     model_version_id: str | None = Field(None, description="Backend-precreated ModelVersion id, for correlation")
