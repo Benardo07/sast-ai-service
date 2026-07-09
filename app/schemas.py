@@ -89,6 +89,22 @@ class RelearnRequest(BaseModel):
     run_name: str | None = None
 
 
+class EvaluateRequest(BaseModel):
+    checkpoint_path: str = Field(..., description="Checkpoint to score (local path or s3:// URI)")
+    base_config: dict = Field(..., description="Base training config (sections: data/model/train)")
+    dataset: list[RelearnDatasetEntry] = Field(..., description="Inline CPG dataset used as a 100% held-out test set")
+    source: str | None = Field(None, description="Name for the materialized eval dataset")
+    base_class_names: list[str] | None = Field(None, description="Model's ordered class names for label alignment")
+    device: str | None = None
+
+
+class EvaluateResponse(BaseModel):
+    job_id: str
+    checkpoint_path: str
+    metrics: dict
+    num_samples: int
+
+
 class BuildCpgRequest(BaseModel):
     code: str = Field(..., description="Function source code")
     language: str | None = Field(None, description="Language hint: c, cpp, java, js, py")

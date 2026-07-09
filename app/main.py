@@ -12,6 +12,8 @@ from app.loader import release_manager
 from app.relearn import relearn_manager
 from app.schemas import (
     ActiveReleaseResponse,
+    EvaluateRequest,
+    EvaluateResponse,
     HealthResponse,
     LoadReleaseRequest,
     ValidateModelRequest,
@@ -144,6 +146,28 @@ async def relearn_status(job_id: str) -> RelearnJobOut:
 @app.get("/relearn", response_model=list[RelearnJobOut])
 async def relearn_list() -> list[RelearnJobOut]:
     return [RelearnJobOut(**asdict(j)) for j in relearn_manager.list()]
+
+
+@app.post("/evaluate", response_model=EvaluateResponse)
+async def evaluate_endpoint(body: EvaluateRequest) -> EvaluateResponse:
+    """Score one checkpoint over an inline CPG dataset used as a 100% held-out test set,
+    returning function-level + localization metrics. Used by the backend evaluation gate
+    to compare champion vs candidate on the same benchmark. Synchronous; the backend calls
+    this from a background task."""
+    try:
+        result = relearn_manager.evaluate_checkpoint(
+            checkpoint_path=body.checkpoint_path,
+            base_config=body.base_config,
+            dataset=[e.model_dump() for e in body.dataset],
+            source=body.source,
+            base_class_names=body.base_class_names,
+            device=body.device,
+        )
+    except (ValueError, FileNotFoundError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=str(exc))
+    return EvaluateResponse(**result)
 
 
 @app.post("/build-cpg", response_model=BuildCpgResponse)

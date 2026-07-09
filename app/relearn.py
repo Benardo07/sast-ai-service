@@ -404,6 +404,82 @@ class RelearnManager:
         (base / "cwe_vocab.json").write_text(json.dumps(vocab, indent=2), encoding="utf-8")
         return len(vocab)
 
+    # ── evaluation (score an existing checkpoint on a held-out set) ─────────
+    def evaluate_checkpoint(
+        self,
+        *,
+        checkpoint_path: str,
+        base_config: dict[str, Any],
+        dataset: list[dict],
+        source: str | None = None,
+        base_class_names: list[str] | None = None,
+        device: str | None = None,
+    ) -> dict[str, Any]:
+        """Run gnn_vuln.evaluate for one checkpoint over an inline CPG dataset used as a
+        100% held-out test set. No training. Returns the metrics_summary. Synchronous —
+        the caller (backend) runs this from a background task. Reuses the relearn dataset
+        writer + target_vocab alignment so labels map onto the model's class space."""
+        if not dataset:
+            raise ValueError("evaluate requires a non-empty inline dataset")
+        if storage.is_s3_uri(checkpoint_path):
+            checkpoint_path = str(storage.ensure_local(checkpoint_path))
+        if not Path(checkpoint_path).exists():
+            raise FileNotFoundError(f"checkpoint not found: {checkpoint_path}")
+
+        job_id = datetime.now(UTC).strftime("%Y%m%d_%H%M%S_") + uuid.uuid4().hex[:6]
+        job_dir = self._job_dir(f"eval_{job_id}")
+        job_dir.mkdir(parents=True, exist_ok=True)
+        mode = (base_config.get("data") or {}).get("mode", "multiclass") if isinstance(base_config, dict) else "multiclass"
+        eff_source = source or f"eval_{job_id}"
+        self._write_inline_dataset(eff_source, dataset, mode)
+
+        cfg = copy.deepcopy(base_config)
+        cfg.setdefault("data", {})
+        cfg["data"]["source"] = eff_source
+        cfg["data"]["raw_dir"] = str(settings.data_root / "raw")
+        cfg["data"]["processed_dir"] = str(settings.data_root / "processed")
+        # 100% test split: train + val = 0 puts every sample in the test set.
+        cfg["data"]["train_ratio"] = 0.0
+        cfg["data"]["val_ratio"] = 0.0
+        cfg.setdefault("train", {})
+        cfg["train"]["results_dir"] = str(job_dir)          # isolate metrics per eval
+        cfg["train"]["checkpoint_dir"] = str(settings.checkpoints_root)
+        if device:
+            cfg["train"]["device"] = device
+        # Align the benchmark labels onto the model's class space (same as relearn).
+        if base_class_names and mode == "multiclass":
+            tv = {name: i for i, name in enumerate(base_class_names)}
+            vpath = settings.data_root / "raw" / eff_source / "cwe_vocab.json"
+            if vpath.exists():
+                for name in json.loads(vpath.read_text(encoding="utf-8")):
+                    if name not in tv:
+                        tv[name] = len(tv)
+            cfg["data"]["target_vocab"] = tv
+            cfg.setdefault("model", {})["num_classes"] = len(tv)
+
+        cfg_path = job_dir / "eval.yaml"
+        cfg_path.write_text(yaml.safe_dump(cfg, sort_keys=False), encoding="utf-8")
+        log = job_dir / "eval.log"
+        env = {**os.environ, "GNN_VULN_API_MODE": "1"}
+        with open(log, "a", encoding="utf-8") as lf:
+            subprocess.run(
+                [sys.executable, "-m", "gnn_vuln.evaluate", "--checkpoint", str(checkpoint_path),
+                 "--config", str(cfg_path), "--metrics-only"],
+                check=True, cwd=str(settings.service_root), env=env,
+                stdout=lf, stderr=subprocess.STDOUT,
+            )
+        # metrics_summary.json is written under results_dir/<checkpoint-parent-name>/
+        summary = next(job_dir.glob("**/metrics_summary.json"), None)
+        if summary is None:
+            raise RuntimeError(f"evaluation produced no metrics (see {log})")
+        data = json.loads(summary.read_text(encoding="utf-8"))
+        return {
+            "job_id": job_id,
+            "checkpoint_path": checkpoint_path,
+            "metrics": self._scalar_metrics(data) if isinstance(data, dict) else {},
+            "num_samples": len(dataset),
+        }
+
     def submit(
         self,
         *,
