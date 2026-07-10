@@ -149,11 +149,15 @@ async def relearn_list() -> list[RelearnJobOut]:
 
 
 @app.post("/evaluate", response_model=EvaluateResponse)
-async def evaluate_endpoint(body: EvaluateRequest) -> EvaluateResponse:
+def evaluate_endpoint(body: EvaluateRequest) -> EvaluateResponse:
     """Score one checkpoint over an inline CPG dataset used as a 100% held-out test set,
     returning function-level + localization metrics. Used by the backend evaluation gate
-    to compare champion vs candidate on the same benchmark. Synchronous; the backend calls
-    this from a background task."""
+    to compare champion vs candidate on the same benchmark.
+
+    Declared `def` (NOT `async def`) on purpose: evaluate_checkpoint runs a blocking
+    gnn_vuln.evaluate subprocess for minutes. A sync endpoint runs in FastAPI's threadpool,
+    so the event loop stays free to serve /predict, /release, /health while eval runs — an
+    `async def` here would freeze the whole service for the duration of the subprocess."""
     try:
         result = relearn_manager.evaluate_checkpoint(
             checkpoint_path=body.checkpoint_path,

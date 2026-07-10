@@ -103,6 +103,7 @@ class EvaluateResponse(BaseModel):
     checkpoint_path: str
     metrics: dict
     num_samples: int
+    num_dropped: int = 0
 
 
 class BuildCpgRequest(BaseModel):

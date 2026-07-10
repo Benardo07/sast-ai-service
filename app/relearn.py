@@ -431,6 +431,20 @@ class RelearnManager:
         job_dir.mkdir(parents=True, exist_ok=True)
         mode = (base_config.get("data") or {}).get("mode", "multiclass") if isinstance(base_config, dict) else "multiclass"
         eff_source = source or f"eval_{job_id}"
+
+        # EVALUATION keeps the model's head FIXED at the checkpoint's classes — unlike relearn,
+        # it never grows the head (that would desync from the checkpoint weights → load error).
+        # A benchmark CWE the model was never trained on is unanswerable by a fixed-class model,
+        # so drop those vulnerable samples (benign is always in-vocab). Their count is reported.
+        dropped = 0
+        if base_class_names and mode == "multiclass":
+            known = set(base_class_names)
+            kept = [e for e in dataset if (not e.get("is_vulnerable")) or (str(e.get("cwe") or "") in known)]
+            dropped = len(dataset) - len(kept)
+            dataset = kept
+            if not dataset:
+                raise ValueError("no benchmark samples have a CWE in the model's class space")
+
         self._write_inline_dataset(eff_source, dataset, mode)
 
         cfg = copy.deepcopy(base_config)
@@ -446,16 +460,11 @@ class RelearnManager:
         cfg["train"]["checkpoint_dir"] = str(settings.checkpoints_root)
         if device:
             cfg["train"]["device"] = device
-        # Align the benchmark labels onto the model's class space (same as relearn).
+        # Fixed target_vocab = the model's exact class list (no extension); num_classes matches
+        # the checkpoint head. The benchmark was already filtered to these classes above.
         if base_class_names and mode == "multiclass":
-            tv = {name: i for i, name in enumerate(base_class_names)}
-            vpath = settings.data_root / "raw" / eff_source / "cwe_vocab.json"
-            if vpath.exists():
-                for name in json.loads(vpath.read_text(encoding="utf-8")):
-                    if name not in tv:
-                        tv[name] = len(tv)
-            cfg["data"]["target_vocab"] = tv
-            cfg.setdefault("model", {})["num_classes"] = len(tv)
+            cfg["data"]["target_vocab"] = {name: i for i, name in enumerate(base_class_names)}
+            cfg.setdefault("model", {})["num_classes"] = len(base_class_names)
 
         cfg_path = job_dir / "eval.yaml"
         cfg_path.write_text(yaml.safe_dump(cfg, sort_keys=False), encoding="utf-8")
@@ -478,6 +487,7 @@ class RelearnManager:
             "checkpoint_path": checkpoint_path,
             "metrics": self._scalar_metrics(data) if isinstance(data, dict) else {},
             "num_samples": len(dataset),
+            "num_dropped": dropped,
         }
 
     def submit(
