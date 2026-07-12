@@ -285,6 +285,45 @@ def load_bigvul(
     return df[["id", "code", "label", "flaw_lines", "cwe"]], vocab
 
 
+def load_api(
+    path: Path,
+    top_k_cwe: int = 0,
+    binary: bool = False,
+    cwe_vocab: dict[str, int] | None = None,
+) -> tuple[pd.DataFrame, dict[str, int]]:
+    """BigVul schema plus an optional per-row flaw_lines annotation, for corpora ingested
+    through the API rather than mined from patches.
+
+    Each vulnerable row localizes itself either by a hand-written flaw_lines list or by a
+    func_after to diff. Resolution is per row, so one file may mix both. A row whose
+    flaw_lines is absent or empty falls back to the diff.
+
+    Kept apart from load_bigvul on purpose: research parquets (MegaVul, relearn) carry a
+    flaw_lines column whose empty lists are meaningful, and must keep diffing.
+    """
+    df, vocab = load_bigvul(path, top_k_cwe=top_k_cwe, binary=binary, cwe_vocab=cwe_vocab)
+    raw = _read_file(path)
+    if "flaw_lines" not in raw.columns:
+        return df, vocab
+
+    def _annotated(row_id: int) -> list[int] | None:
+        if not (0 <= row_id < len(raw)):
+            return None
+        fl = raw["flaw_lines"].iloc[row_id]
+        if fl is None or (isinstance(fl, float) and pd.isna(fl)) or len(fl) == 0:
+            return None
+        return sorted({int(i) for i in fl})
+
+    n = 0
+    for pos, row in enumerate(df.itertuples(index=False)):
+        given = _annotated(int(row.id)) if row.label != 0 else None
+        if given is not None:
+            df.iat[pos, df.columns.get_loc("flaw_lines")] = given
+            n += 1
+    logger.info(f"Flaw lines: {n} row(s) from the flaw_lines column, rest from the diff")
+    return df, vocab
+
+
 def load_diversevul(path: Path) -> pd.DataFrame:
     """
     Binary only (target column). No localization ground truth.
@@ -511,7 +550,7 @@ def main() -> None:
     parser.add_argument("--input", required=True, type=Path)
     parser.add_argument(
         "--format", default="devign",
-        choices=["devign", "bigvul", "megavul", "diversevul", "csv", "merged", "titanvul", "relearn", "megavul_cil"],
+        choices=["devign", "bigvul", "api", "megavul", "diversevul", "csv", "merged", "titanvul", "relearn", "megavul_cil"],
     )
     parser.add_argument("--code-col", default="func")
     parser.add_argument("--label-col", default="target")
@@ -561,7 +600,8 @@ def main() -> None:
         df = load_devign(args.input)
         is_multi_class = False
 
-    elif args.format == "bigvul":
+    elif args.format in ("bigvul", "api"):
+        # api = bigvul schema + optional per-row flaw_lines annotation (API ingest)
         # Determine if multi-class
         is_multi_class = not args.binary
 
@@ -575,7 +615,8 @@ def main() -> None:
                 f"Loaded existing CWE vocab ({len(existing_vocab)} classes) from {vocab_path}"
             )
 
-        df, cwe_vocab = load_bigvul(
+        loader = load_api if args.format == "api" else load_bigvul
+        df, cwe_vocab = loader(
             args.input,
             top_k_cwe=args.top_cwe,
             binary=args.binary,

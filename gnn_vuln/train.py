@@ -837,6 +837,11 @@ class TrainingSession:
                 logger.info(f"Early stopping at epoch {epoch}.")
                 break
 
+        # Evaluate the best-val checkpoint (the saved, deployed model), not the
+        # last-epoch weights left in memory after early-stopping patience epochs.
+        if cm.best_path.exists():
+            cm.load_model(trainer.model, device=str(self.device))
+            logger.info(f"Reloaded best checkpoint for test eval → {cm.best_path.name}")
         test_m = trainer.evaluate(test_loader, self._is_binary, class_weight)
         test_acc, test_conf = test_m["acc"], test_m["conf"]
         test_f1, test_f1w = test_m["f1_macro"], test_m["f1_weighted"]
