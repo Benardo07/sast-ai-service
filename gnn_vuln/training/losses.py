@@ -148,6 +148,51 @@ def mil_loss_multiclass(
     return torch.stack(losses).mean()
 
 
+# ── Supervised localization loss ──────────────────────────────────────────────
+
+def supervised_loc_loss(
+    stmt_scores_list: list[torch.Tensor],
+    batch_idx: torch.Tensor,
+    node_line: torch.Tensor,
+    flaw_line_mask: torch.Tensor,
+    labels: torch.Tensor,
+    pos_weight: float = 0.0,
+) -> torch.Tensor:
+    """
+    Fully supervised localization: per-statement BCE against flaw-line labels
+    (LineVD-style), instead of weak MIL/ranking signals. Only vulnerable
+    functions (label > 0) that have at least one flaw line contribute;
+    unlabeled functions are skipped exactly like the fully supervised baselines.
+    pos_weight > 0 upweights the rare positive (flaw) statements.
+    """
+    device = labels.device
+    vuln_indices: list[int] = (labels > 0).nonzero(as_tuple=False).squeeze(1).tolist()
+    pw = torch.tensor(pos_weight, device=device) if pos_weight > 0 else None
+    losses: list[torch.Tensor] = []
+    for b in vuln_indices:
+        scores = stmt_scores_list[b]
+        if len(scores) == 0:
+            continue
+        mask = batch_idx == b
+        lines_b = node_line[mask]
+        flaw_b  = flaw_line_mask[mask]
+        valid = lines_b >= 0
+        if not valid.any():
+            continue
+        lines_b = lines_b[valid]
+        flaw_b  = flaw_b[valid].float()
+        unique_lines, inv = torch.unique(lines_b, sorted=True, return_inverse=True)
+        n_unique = unique_lines.shape[0]
+        flaw_max = torch.zeros(n_unique, device=device)
+        flaw_max.scatter_reduce_(0, inv, flaw_b, reduce='amax', include_self=True)
+        if not flaw_max.bool().any():
+            continue  # vulnerable function without line labels — no signal
+        losses.append(F.binary_cross_entropy_with_logits(scores, flaw_max, pos_weight=pw))
+    if not losses:
+        return torch.tensor(0.0, device=device)
+    return torch.stack(losses).mean()
+
+
 # ── Ranking loss ──────────────────────────────────────────────────────────────
 
 def ranking_loss(

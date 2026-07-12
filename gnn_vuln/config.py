@@ -132,6 +132,8 @@ class ModelConfig:
     mil_weight: float = 0.5     # λ: weight of stmt MIL loss vs function loss
     mil_k: int = 3              # top-k statements used for pseudo-label assignment
     rank_loss_weight: float = 0.0  # pairwise ranking loss weight (0 = disabled)
+    loc_supervised_weight: float = 0.0      # fully supervised per-stmt BCE loc loss (0 = disabled, test)
+    loc_supervised_pos_weight: float = 0.0  # BCE pos_weight for rare flaw statements (0 = off)
     # Sliding-window encoding for long functions (live LM branch only).
     # func_chunk_size: tokens per window; should match the model's trained max length
     #   (512 for UniXcoder/CodeBERT, 512 for codet5p-110m-embedding, 1024 for codet5p-220m).

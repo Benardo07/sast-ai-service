@@ -62,6 +62,8 @@ class TrainingSession:
         self._mil_k              = getattr(cfg.model, "mil_k", 3)
         self._mil_weight         = getattr(cfg.model, "mil_weight", 0.5)
         self._rank_loss_weight   = getattr(cfg.model, "rank_loss_weight", 0.0)
+        self._loc_supervised_weight     = getattr(cfg.model, "loc_supervised_weight", 0.0)
+        self._loc_supervised_pos_weight = getattr(cfg.model, "loc_supervised_pos_weight", 0.0)
         self._group_loss_weight  = getattr(cfg.model, "group_loss_weight", 0.0)
         self._binary_loss_weight = getattr(cfg.model, "binary_loss_weight", 0.0)
         self._focal_gamma        = getattr(cfg.train, "focal_loss_gamma", 0.0)
@@ -240,6 +242,8 @@ class TrainingSession:
             step_per_batch=step_per_batch, device=device,
             mil_k=self._mil_k, mil_weight=self._mil_weight,
             rank_loss_weight=self._rank_loss_weight, focal_gamma=self._focal_gamma,
+            loc_supervised_weight=self._loc_supervised_weight,
+            loc_supervised_pos_weight=self._loc_supervised_pos_weight,
             group_loss_weight=self._group_loss_weight, binary_loss_weight=self._binary_loss_weight,
             supcon_fn=supcon_fn, supcon_weight=self._supcon_weight,
             self_supcon_weight=self._self_supcon_weight,

@@ -57,6 +57,7 @@ from gnn_vuln.training.losses import (
     mil_loss,
     mil_loss_multiclass,
     ranking_loss,
+    supervised_loc_loss,
 )
 
 # Import lazily to avoid circular imports; resolved at runtime
@@ -94,6 +95,8 @@ class Trainer:
         mil_k: int = 3,
         mil_weight: float = 0.0,
         rank_loss_weight: float = 0.0,
+        loc_supervised_weight: float = 0.0,
+        loc_supervised_pos_weight: float = 0.0,
         focal_gamma: float = 0.0,
         group_loss_weight: float = 0.0,
         binary_loss_weight: float = 0.0,
@@ -134,6 +137,8 @@ class Trainer:
         self.mil_k              = mil_k
         self.mil_weight         = mil_weight
         self.rank_loss_weight   = rank_loss_weight
+        self.loc_supervised_weight     = loc_supervised_weight
+        self.loc_supervised_pos_weight = loc_supervised_pos_weight
         self.focal_gamma        = focal_gamma
         self.group_loss_weight  = group_loss_weight
         self.binary_loss_weight = binary_loss_weight
@@ -391,6 +396,23 @@ class Trainer:
                 raw["rank"] = rl
                 if not use_balance:
                     loss = loss + self.rank_loss_weight * rl
+
+        # Fully supervised localization loss (test mode; binary stmt heads only)
+        if (
+            stmt_scores is not None
+            and self.loc_supervised_weight > 0.0
+            and node_line is not None
+            and (len(stmt_scores) == 0 or stmt_scores[0].dim() == 1)
+        ):
+            flaw_mask = getattr(batch, "flaw_line_mask", None)
+            if flaw_mask is not None:
+                sl = supervised_loc_loss(
+                    stmt_scores, batch.batch, node_line, flaw_mask, batch.y,
+                    pos_weight=self.loc_supervised_pos_weight,
+                )
+                raw["loc_sup"] = sl
+                if not use_balance:
+                    loss = loss + self.loc_supervised_weight * sl
 
         # MTL balance: combine raw losses via learned uncertainty (kendall) or
         # leave for PCGrad to split per-task gradients (pcgrad uses raw dict directly).
