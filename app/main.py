@@ -60,7 +60,7 @@ async def runtimes() -> dict:
 
 
 @app.post("/validate-model")
-async def validate_model(body: ValidateModelRequest) -> dict:
+def validate_model(body: ValidateModelRequest) -> dict:
     """Dry-load a checkpoint+config (no side effects) to confirm gnn_vuln can run it."""
     return release_manager.validate(
         checkpoint_path=body.checkpoint_path, config_path=body.config_path, device=body.device,
@@ -68,7 +68,7 @@ async def validate_model(body: ValidateModelRequest) -> dict:
 
 
 @app.post("/load-release", response_model=ActiveReleaseResponse)
-async def load_release(body: LoadReleaseRequest) -> ActiveReleaseResponse:
+def load_release(body: LoadReleaseRequest) -> ActiveReleaseResponse:
     try:
         release_manager.load_release(
             model_version_id=body.model_version_id,
@@ -76,6 +76,7 @@ async def load_release(body: LoadReleaseRequest) -> ActiveReleaseResponse:
             config_path=body.config_path,
             device=body.device,
             force_reload=body.force_reload,
+            class_names=body.class_names,
         )
     except Exception as exc:
         release_manager.remember_load_error(exc)
@@ -86,7 +87,7 @@ async def load_release(body: LoadReleaseRequest) -> ActiveReleaseResponse:
 
 
 @app.post("/predict", response_model=PredictResponse)
-async def predict(body: PredictRequest) -> PredictResponse:
+def predict(body: PredictRequest) -> PredictResponse:
     if not (body.code and body.code.strip()) and not (body.cpg_path and body.cpg_path.strip()):
         raise HTTPException(status_code=422, detail="Provide 'code' or 'cpg_path'")
     try:
@@ -126,6 +127,7 @@ async def relearn(body: RelearnRequest) -> RelearnJobOut:
             base_checkpoint_path=body.base_checkpoint_path,
             base_class_names=body.base_class_names,
             replay_source=body.replay_source,
+            replay_bundle_uri=body.replay_bundle_uri,
             device=body.device,
             model_version_id=body.model_version_id,
             run_name=body.run_name,
@@ -175,7 +177,7 @@ def evaluate_endpoint(body: EvaluateRequest) -> EvaluateResponse:
 
 
 @app.post("/build-cpg", response_model=BuildCpgResponse)
-async def build_cpg_endpoint(body: BuildCpgRequest) -> BuildCpgResponse:
+def build_cpg_endpoint(body: BuildCpgRequest) -> BuildCpgResponse:
     """Generate a Joern CPG for one function. The backend caches the result."""
     from app.cpg import build_cpg
 

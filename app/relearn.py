@@ -55,6 +55,7 @@ class RelearnJobState:
     result_checkpoint_path: str | None = None
     result_config_path: str | None = None
     metrics: dict[str, Any] | None = None
+    class_names: list[str] | None = None
     model_version_id: str | None = None
     message: str | None = None
     created_at: str = field(default_factory=_utc_now_iso)
@@ -67,6 +68,10 @@ class RelearnManager:
     def __init__(self) -> None:
         self._lock = RLock()
         self._jobs: dict[str, RelearnJobState] = {}
+        # Single-slot GPU gate: /relearn spawns a worker thread per submit, but only ONE may
+        # actually train at a time — overlapping submits queue instead of thrashing the GPU
+        # (review #5). Jobs stay "queued" until they acquire this, then flip to "running".
+        self._train_gate = threading.Semaphore(1)
 
     # ── persistence (on-disk, no DB) ──────────────────────────────────────
     def _job_dir(self, job_id: str) -> Path:
@@ -136,13 +141,18 @@ class RelearnManager:
         # Make gnn_vuln write checkpoints/results where this service looks for them
         # (otherwise it falls back to its own ./checkpoints and the result is "not found").
         cfg.setdefault("train", {})["checkpoint_dir"] = str(settings.checkpoints_root)
-        cfg["train"]["results_dir"] = str(settings.results_root)
+        # results_dir is per-job (NOT the shared results_root) so two jobs never read each
+        # other's summary — _parse_metrics reads this job's own dir (review #11).
+        cfg["train"]["results_dir"] = str(job_dir)
 
         # Continual-learning label alignment: when continuing a base model, remap task-B labels
         # onto the base model's class space so ids never clash. Known CWEs keep their canonical
         # id; brand-new CWEs (class-incremental) extend the head and num_classes grows to fit.
         # gnn_vuln applies the remap at load via data.target_vocab. retrain (no base) skips this.
-        if method != "retrain" and base_class_names and materialized:
+        # Applied for ANY continued base (materialized inline/bundle OR a pre-staged data_source):
+        # the vpath.exists() check below guards head extension, so a data_source-only job whose
+        # raw/<source>/cwe_vocab.json exists is aligned too — its labels no longer clash (#13).
+        if method != "retrain" and base_class_names:
             tv = {name: i for i, name in enumerate(base_class_names)}
             vpath = settings.data_root / "raw" / data_source / "cwe_vocab.json"
             if vpath.exists():
@@ -239,10 +249,41 @@ class RelearnManager:
                         out[f"{k}.{sk}"] = float(sv)
         return out
 
-    def _parse_metrics(self, checkpoint: Path) -> dict[str, Any] | None:
+    @staticmethod
+    def _derive_class_names(train_cfg: Path, data_source: str) -> list[str] | None:
+        """The trained model's ordered class list, so the backend can tag the new version
+        (serving labels #1 + next relearn's base class space #8). Prefer the grown
+        target_vocab written into the job's train config; fall back to the source's
+        cwe_vocab.json. Returns None when neither is available (e.g. binary mode)."""
+        try:
+            cfg = yaml.safe_load(train_cfg.read_text(encoding="utf-8")) or {}
+        except Exception:  # noqa: BLE001
+            cfg = {}
+        tv = (cfg.get("data") or {}).get("target_vocab") if isinstance(cfg, dict) else None
+        if isinstance(tv, dict) and tv:
+            names = [""] * (max(int(v) for v in tv.values()) + 1)
+            for name, idx in tv.items():
+                if 0 <= int(idx) < len(names):
+                    names[int(idx)] = name
+            return names
+        vpath = settings.data_root / "raw" / data_source / "cwe_vocab.json"
+        if vpath.exists():
+            try:
+                vocab = json.loads(vpath.read_text(encoding="utf-8"))
+                if isinstance(vocab, dict) and vocab:
+                    names = [""] * (max(int(v) for v in vocab.values()) + 1)
+                    for name, idx in vocab.items():
+                        if 0 <= int(idx) < len(names):
+                            names[int(idx)] = name
+                    return names
+            except Exception:  # noqa: BLE001
+                pass
+        return None
+
+    def _parse_metrics(self, checkpoint: Path, results_dir: Path | None = None) -> dict[str, Any] | None:
         """Best-effort: read training_summary.json + metrics_summary.json near the
         checkpoint / results dir, merging all scalar numeric metrics found."""
-        search_dirs = [checkpoint.parent, settings.results_root]
+        search_dirs = [checkpoint.parent, results_dir, settings.results_root]
         filenames = ("training_summary.json", "metrics_summary.json")
         metrics: dict[str, float] = {}
         for d in search_dirs:
@@ -273,6 +314,12 @@ class RelearnManager:
 
     # ── job runner ────────────────────────────────────────────────────────
     def _run_job(self, job: RelearnJobState, train_cfg: Path, importance_cfg: Path | None) -> None:
+        # Serialize on the GPU gate: a concurrent job waits here (staying "queued") until the
+        # active one releases, so two trainings never run at once (review #5).
+        with self._train_gate:
+            self._run_job_locked(job, train_cfg, importance_cfg)
+
+    def _run_job_locked(self, job: RelearnJobState, train_cfg: Path, importance_cfg: Path | None) -> None:
         log = Path(job.log_path) if job.log_path else self._job_dir(job.job_id) / "run.log"
         started_at = datetime.now(UTC).timestamp()
         # GNN_VULN_API_MODE tells the library it runs under a service: skip research-only
@@ -320,7 +367,20 @@ class RelearnManager:
                         lf.write(f"WARN evaluate (metrics-only) failed: {type(e).__name__}: {e}\n")
                 job.result_checkpoint_path = str(best)
                 job.result_config_path = str(train_cfg)
-                job.metrics = self._parse_metrics(best)
+                job.metrics = self._parse_metrics(best, self._job_dir(job.job_id))
+                # The trained model's ordered class list — the backend tags the new version
+                # with it (correct serving CWE labels + base class space for the next relearn).
+                job.class_names = self._derive_class_names(train_cfg, job.data_source)
+                # For retrain, drop a cwe_vocab.json next to the checkpoint so the class space
+                # is recoverable straight from artifacts (review #8).
+                if job.class_names:
+                    try:
+                        (best.parent / "cwe_vocab.json").write_text(
+                            json.dumps({n: i for i, n in enumerate(job.class_names)}, indent=2),
+                            encoding="utf-8",
+                        )
+                    except Exception:  # noqa: BLE001
+                        pass
                 # In S3 mode push the checkpoint (+ its config sibling) to object storage so
                 # any backend/worker node can deploy it later — `result_checkpoint_path`
                 # becomes the s3:// pointer the backend stores as the model version source_uri.
@@ -331,6 +391,11 @@ class RelearnManager:
                         cfg_sibling = best.parent / "config.yaml"
                         cfg_src = cfg_sibling if cfg_sibling.exists() else train_cfg
                         storage.put_file(settings.s3_bucket_checkpoints, f"{prefix}/config.yaml", cfg_src)
+                        # Ship the class vocab alongside so a redeployed node can recover the
+                        # class space from artifacts alone (review #8).
+                        vocab_sibling = best.parent / "cwe_vocab.json"
+                        if vocab_sibling.exists():
+                            storage.put_file(settings.s3_bucket_checkpoints, f"{prefix}/cwe_vocab.json", vocab_sibling)
                         job.result_checkpoint_path = uri
                     except Exception as e:  # noqa: BLE001 - keep local path if upload fails
                         with open(log, "a", encoding="utf-8") as lf:
@@ -390,6 +455,11 @@ class RelearnManager:
             sub = "vulnerable" if vuln else "benign"
             fname = f"func_{i}"
             (base / sub / f"{fname}.json").write_text(json.dumps(e.get("cpg_json")), encoding="utf-8")
+            # `raw_func` (function source) is the func-LM branch input for hybrid_graph_lm &
+            # sequential — written for BOTH vulnerable and benign, else those heads see empty
+            # text. `row_id` = sample_uid keeps per-sample provenance back to the platform.
+            raw_func = e.get("code") or ""
+            sample_uid = e.get("sample_uid")
             if vuln:
                 cwe = e.get("cwe") or "UNKNOWN"
                 if mode == "multiclass":
@@ -399,8 +469,13 @@ class RelearnManager:
                     class_id = vocab[cwe]
                 else:
                     class_id = 1
-                meta = {"class_id": class_id, "cwe": cwe, "flaw_lines": e.get("flaw_lines") or []}
-                (base / sub / f"{fname}.meta.json").write_text(json.dumps(meta), encoding="utf-8")
+                meta = {"class_id": class_id, "cwe": cwe, "flaw_lines": e.get("flaw_lines") or [],
+                        "raw_func": raw_func}
+            else:
+                meta = {"class_id": 0, "cwe": "benign", "flaw_lines": [], "raw_func": raw_func}
+            if sample_uid:
+                meta["row_id"] = sample_uid
+            (base / sub / f"{fname}.meta.json").write_text(json.dumps(meta), encoding="utf-8")
         (base / "cwe_vocab.json").write_text(json.dumps(vocab, indent=2), encoding="utf-8")
         return len(vocab)
 
@@ -523,6 +598,7 @@ class RelearnManager:
         base_checkpoint_path: str | None = None,
         base_class_names: list[str] | None = None,
         replay_source: str | None = None,
+        replay_bundle_uri: str | None = None,
         device: str | None = None,
         model_version_id: str | None = None,
         run_name: str | None = None,
@@ -563,6 +639,14 @@ class RelearnManager:
             materialized = True
         if not data_source:
             raise ValueError("an inline dataset, a dataset_bundle_uri, or a data_source is required")
+
+        # Replay / EWC-importance source. When the backend passes the base model's training
+        # dataset as a durable bundle (replay_bundle_uri — derived from the champion being
+        # relearned, mirroring the reference `base["dataset_id"]` → replay.source), install it
+        # here and use its source name. This overrides any manual replay_source and is what
+        # makes EWC/ER actually protect task-A knowledge. No-op for finetune/retrain.
+        if replay_bundle_uri and method in (_REPLAY_METHODS | _EWC_METHODS):
+            replay_source = self._install_bundle(replay_bundle_uri)
 
         job = RelearnJobState(
             job_id=job_id,

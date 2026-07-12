@@ -31,6 +31,8 @@ class Settings(BaseSettings):
     s3_bucket_checkpoints: str = "checkpoints"
     # Local cache for checkpoints downloaded from object storage.
     checkpoint_cache_dir: str = "./var/checkpoint-cache"
+    # Cap on cached checkpoint dirs (LRU-evicted by last-access). 0 = unbounded (review #16).
+    checkpoint_cache_max_entries: int = 32
 
     model_config = {
         "env_prefix": "SAST_AI_",

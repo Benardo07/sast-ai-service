@@ -83,6 +83,31 @@ def _download(client, bucket: str, key: str, dest: Path) -> None:
     tmp.replace(dest)  # atomic: avoid a half-written cache entry
 
 
+def _evict_cache(keep_dir: Path) -> None:
+    """LRU-evict the checkpoint cache: when it holds more than
+    ``checkpoint_cache_max_entries`` per-artifact dirs, remove the least-recently-touched
+    ones (by mtime) until back under the cap. ``keep_dir`` (the entry just used) is never
+    evicted. Best-effort and unbounded-safe: max_entries<=0 disables eviction (review #16)."""
+    import shutil
+
+    cap = settings.checkpoint_cache_max_entries
+    root = settings.checkpoint_cache_root
+    if cap <= 0 or not root.exists():
+        return
+    dirs = [d for d in root.iterdir() if d.is_dir()]
+    if len(dirs) <= cap:
+        return
+    keep = keep_dir.resolve()
+    dirs.sort(key=lambda d: d.stat().st_mtime)  # oldest first
+    for d in dirs[: len(dirs) - cap]:
+        if d.resolve() == keep:
+            continue
+        try:
+            shutil.rmtree(d, ignore_errors=True)
+        except Exception:  # noqa: BLE001 - eviction is best-effort
+            continue
+
+
 def ensure_local(uri: str) -> Path:
     """Return a LOCAL path for an artifact pointer. For an ``s3://`` URI the blob is
     downloaded into a per-artifact cache dir (idempotent by URI hash); the sibling
@@ -107,4 +132,13 @@ def ensure_local(uri: str) -> Path:
                 break
             except Exception:  # noqa: BLE001 - no sibling config in the bucket
                 continue
+        _evict_cache(keep_dir=art_dir)
+    else:
+        # Bump the dir mtime so a cache hit counts as a recent access for LRU ordering.
+        try:
+            import os
+
+            os.utime(art_dir, None)
+        except Exception:  # noqa: BLE001
+            pass
     return dest

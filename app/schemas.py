@@ -20,6 +20,10 @@ class LoadReleaseRequest(BaseModel):
     config_path: str | None = None
     device: str | None = None
     force_reload: bool = False
+    # The model's ordered class list (backend-owned, from the ModelVersion class_names tag).
+    # Overrides the predictor's checkpoint-derived vocab so /predict returns the right CWE
+    # names for relearned/CIL models (whose sibling cwe_vocab.json is the task-B vocab).
+    class_names: list[str] | None = None
 
 
 class ValidateModelRequest(BaseModel):
@@ -68,6 +72,10 @@ class RelearnDatasetEntry(BaseModel):
     flaw_lines: list[int] = []
     func_name: str | None = None
     sample_uid: str | None = None
+    # Full function source. Written to the sample's meta as `raw_func` — the func-LM branch
+    # (hybrid_graph_lm, sequential) tokenizes it; without it those architectures train/eval
+    # on empty LM input. Ignored by the pure-GNN graph_based architecture.
+    code: str | None = None
 
     model_config = {"extra": "allow"}
 
@@ -84,6 +92,7 @@ class RelearnRequest(BaseModel):
     base_checkpoint_path: str | None = Field(None, description="Task-A checkpoint (.pt) for finetune/EWC/ER/EWC-ER")
     base_class_names: list[str] | None = Field(None, description="Base model's ordered class names. When continuing a base model, task-B labels are remapped onto this class space (known CWEs keep their id, new CWEs extend the head).")
     replay_source: str | None = Field(None, description="Task-A data source for replay / EWC importance")
+    replay_bundle_uri: str | None = Field(None, description="URI (s3://… or path) to the base model's training dataset bundle (.tar.gz of the gnn_vuln data/ layout). Installed into the data root and used as the replay/EWC source — the durable equivalent of replay_source, derived by the backend from the champion being relearned.")
     device: str | None = None
     model_version_id: str | None = Field(None, description="Backend-precreated ModelVersion id, for correlation")
     run_name: str | None = None
@@ -128,6 +137,10 @@ class RelearnJobOut(BaseModel):
     result_checkpoint_path: str | None = None
     result_config_path: str | None = None
     metrics: dict | None = None
+    # The trained model's ordered class list (index = class id). The backend stores this as the
+    # new version's class_names tag so /predict labels CWEs correctly and the next relearn aligns
+    # task-B labels onto this class space. None for binary/unknown-vocab runs (review #8).
+    class_names: list[str] | None = None
     model_version_id: str | None = None
     message: str | None = None
     created_at: str | None = None

@@ -102,6 +102,7 @@ class ReleaseManager:
         config_path: str | None,
         device: str | None,
         force_reload: bool = False,
+        class_names: list[str] | None = None,
     ) -> LoadedRelease:
         with self._lock:
             resolved_checkpoint = self._resolve_workspace_path(checkpoint_path)
@@ -119,6 +120,16 @@ class ReleaseManager:
 
             summary = self._load_config_summary(resolved_config)
             predictor = self._load_predictor(resolved_checkpoint, resolved_config, resolved_device)
+            # Backend-owned class names win over the checkpoint's derived vocab: for a relearned
+            # model the sibling cwe_vocab.json is the task-B vocab (wrong ids), so /predict would
+            # otherwise mislabel. Only override when the count matches the model's head.
+            if class_names:
+                try:
+                    if not getattr(predictor, "class_names", None) or \
+                            len(class_names) == len(predictor.class_names):
+                        predictor.class_names = list(class_names)
+                except Exception:  # noqa: BLE001 - never let labeling break a load
+                    pass
             release = LoadedRelease(
                 model_version_id=model_version_id,
                 checkpoint_path=str(resolved_checkpoint),
