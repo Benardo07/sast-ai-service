@@ -30,11 +30,14 @@ class LocalizationExtractor:
         y_prob      : np.ndarray [N, C]
         confidence  : np.ndarray [N]
         loc_results : list[dict]  — one per function
+        embeddings  : np.ndarray [N, D]  — pre-head graph representation (for drift baselines);
+                      empty [0, 0] array if the model output exposes no such vector.
         """
         import numpy as np
 
         self.model.eval()
         all_y, all_pred, all_prob, all_conf = [], [], [], []
+        all_emb: list = []
         loc_results: list[dict] = []
 
         for batch in self.loader:
@@ -56,6 +59,18 @@ class LocalizationExtractor:
             all_prob.append(probs)
             all_conf.extend(confs.tolist())
 
+            # Pre-head graph representation = last output element (mirrors inference.py's
+            # cls_repr = out[-1]). Captured for the embedding/MMD drift baseline. Defensive:
+            # a model whose output has no such vector must not break metric evaluation.
+            try:
+                emb = out[-1] if isinstance(out, (tuple, list)) and len(out) >= 2 else None
+                if emb is not None and hasattr(emb, "detach") and emb.dim() == 2 and emb.size(0) == len(preds):
+                    all_emb.append(emb.detach().float().cpu().numpy())
+                else:
+                    all_emb.append(None)
+            except Exception:  # noqa: BLE001 - embeddings are best-effort, never fatal
+                all_emb.append(None)
+
             if stmt_scores_list is not None and node_line is not None:
                 B = int(batch.batch.max().item()) + 1
                 for b in range(B):
@@ -69,12 +84,23 @@ class LocalizationExtractor:
                 for _ in range(B):
                     loc_results.append(LocalizationMetrics.make_result([], [], []))
 
+        # Stack embeddings only if EVERY batch produced them with a consistent width; any gap
+        # makes the baseline unusable, so fall back to empty rather than a misaligned matrix.
+        if all_emb and all(e is not None for e in all_emb):
+            try:
+                embeddings = np.vstack(all_emb)
+            except Exception:  # noqa: BLE001
+                embeddings = np.zeros((0, 0))
+        else:
+            embeddings = np.zeros((0, 0))
+
         return (
             np.array(all_y),
             np.array(all_pred),
             np.vstack(all_prob) if all_prob else np.zeros((0, 2)),
             np.array(all_conf),
             loc_results,
+            embeddings,
         )
 
     def _forward(self, batch, node_line, edge_attr):

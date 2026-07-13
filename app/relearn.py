@@ -576,12 +576,23 @@ class RelearnManager:
         if summary is None:
             raise RuntimeError(f"evaluation produced no metrics (see {log})")
         data = json.loads(summary.read_text(encoding="utf-8"))
+        # Optional drift-baseline sidecar (per-sample confidence/error + capped embeddings),
+        # written next to metrics_summary.json by the evaluator. Best-effort: absence or a
+        # parse error must not fail the evaluation.
+        baseline = None
+        try:
+            sidecar = summary.parent / "baseline_signals.json"
+            if sidecar.exists():
+                baseline = json.loads(sidecar.read_text(encoding="utf-8"))
+        except Exception:  # noqa: BLE001
+            baseline = None
         return {
             "job_id": job_id,
             "checkpoint_path": checkpoint_path,
             "metrics": self._scalar_metrics(data) if isinstance(data, dict) else {},
             "num_samples": len(dataset),
             "num_dropped": dropped,
+            "baseline": baseline,
         }
 
     def submit(

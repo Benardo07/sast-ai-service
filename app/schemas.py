@@ -113,6 +113,9 @@ class EvaluateResponse(BaseModel):
     metrics: dict
     num_samples: int
     num_dropped: int = 0
+    # Drift-baseline signals captured during the eval pass (per-sample confidence/error +
+    # capped pre-head embeddings). None when the evaluator produced no sidecar.
+    baseline: dict | None = None
 
 
 class BuildCpgRequest(BaseModel):

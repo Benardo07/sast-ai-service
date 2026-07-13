@@ -49,6 +49,7 @@ class EvalResult:
     loc_results: list
     func_metrics: dict
     loc_metrics: LocalizationMetrics
+    embeddings: "np.ndarray | None" = None   # [N, D] pre-head graph reps for drift baseline
 
 
 # ---------------------------------------------------------------------------
@@ -96,7 +97,7 @@ class Evaluator:
         `.summary`; research: `save_artifacts`)."""
         logger.info("Running inference…")
         extractor = LocalizationExtractor(self.model, self._loader, self.device)
-        y_true, y_pred, y_prob, confidence, loc_results = extractor.run()
+        y_true, y_pred, y_prob, confidence, loc_results, embeddings = extractor.run()
 
         target_names = self.class_names or [str(i) for i in range(y_prob.shape[1])]
         correct_mask = y_true == y_pred
@@ -109,7 +110,8 @@ class Evaluator:
                            loc_results, y_true, confidence, correct_mask)
         summary = self._build_summary(func_metrics, loc_metrics)
         return EvalResult(summary, y_true, y_pred, y_prob, confidence, correct_mask,
-                          target_names, loc_results, func_metrics, loc_metrics)
+                          target_names, loc_results, func_metrics, loc_metrics,
+                          embeddings=embeddings)
 
     def run(self) -> dict:
         """Full evaluation + persist all research artifacts to results_dir
@@ -333,7 +335,49 @@ class Evaluator:
         with open(self.results_dir / "metrics_summary.json", "w") as f:
             json.dump(res.summary, f, indent=2)
         logger.info(f"metrics_summary.json → {self.results_dir/'metrics_summary.json'} (metrics-only)")
+
+        # Sidecar for drift baselines: per-sample confidence (ADWIN/KS/PSI/IForest),
+        # per-sample error 1=wrong/0=correct (DDM), and a capped sample of pre-head graph
+        # embeddings (MMD). Best-effort — a failure here must never break metrics_summary.json.
+        try:
+            self._write_baseline_signals(res)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"baseline_signals.json not written: {exc}")
         return res.summary
+
+    # Cap on embedding rows persisted for the drift baseline: MMD needs ~100 vectors, and a
+    # full 1000×D matrix bloats the eval response. Confidence/error arrays are 1 float each so
+    # they are kept in full.
+    _BASELINE_EMB_CAP = 600
+
+    def _write_baseline_signals(self, res: EvalResult) -> None:
+        import numpy as np
+
+        conf = [self._safe(float(c)) for c in np.asarray(res.confidence).ravel().tolist()]
+        # correct_mask True=correct → error 0; False=wrong → error 1.
+        err = [0 if bool(c) else 1 for c in np.asarray(res.correct_mask).ravel().tolist()]
+        acc = (float(np.mean(res.correct_mask)) if len(res.correct_mask) else None)
+
+        emb_list: list = []
+        emb = getattr(res, "embeddings", None)
+        if emb is not None and getattr(emb, "size", 0) and emb.ndim == 2 and emb.shape[0] > 0:
+            rows = emb[: self._BASELINE_EMB_CAP]
+            emb_list = [[self._safe(float(v)) for v in row] for row in rows.tolist()]
+
+        payload = {
+            "num_samples": int(len(conf)),
+            "accuracy": self._safe(acc) if acc is not None else None,
+            "confidence": conf,
+            "error": err,
+            "embeddings": emb_list,
+            "embedding_dim": (len(emb_list[0]) if emb_list else 0),
+        }
+        with open(self.results_dir / "baseline_signals.json", "w") as f:
+            json.dump(payload, f)
+        logger.info(
+            f"baseline_signals.json → {self.results_dir/'baseline_signals.json'} "
+            f"(conf={len(conf)}, emb={len(emb_list)})"
+        )
 
 
 # ---------------------------------------------------------------------------
