@@ -1,4 +1,4 @@
-"""CPG generation: function source -> Joern CPG JSON, via the vendored gnn_vuln.
+"""CPG generation: function source -> Joern CPG JSON, via the installed gnn-vuln library.
 
 Used by the backend's dataset materializer (single source of truth) which caches
 the result in its own ``graph_cache`` table. This service only does the parsing.

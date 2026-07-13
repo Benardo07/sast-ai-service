@@ -33,6 +33,13 @@ class Settings(BaseSettings):
     checkpoint_cache_dir: str = "./var/checkpoint-cache"
     # Cap on cached checkpoint dirs (LRU-evicted by last-access). 0 = unbounded (review #16).
     checkpoint_cache_max_entries: int = 32
+    # ── Async job queue (Celery) — long jobs (relearn/train) run in a SEPARATE worker
+    # process so the API container stays reserved for inference (the model forward keeps
+    # responding while a multi-minute training runs elsewhere). Its OWN Redis DBs (3/4) +
+    # a dedicated queue name keep it isolated from sast-backend's Celery on the same Redis.
+    celery_broker_url: str = "redis://localhost:6379/3"
+    celery_result_backend: str = "redis://localhost:6379/4"
+    relearn_queue: str = "ai_relearn"
 
     model_config = {
         "env_prefix": "SAST_AI_",

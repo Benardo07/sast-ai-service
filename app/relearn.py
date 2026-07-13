@@ -1,7 +1,8 @@
 """Relearn (continual-learning) jobs for the standalone AI service.
 
 Ported and adapted from the original training repo. Key differences:
-  * Self-contained: trains via the VENDORED ``gnn_vuln`` package (no tugas-akhir).
+  * Trains via the installed ``gnn-vuln`` library package (its ``python -m`` module
+    entrypoints), invoked in a Celery worker process — no vendored source tree.
   * Stateless w.r.t. the domain model: this service owns NO model/dataset registry.
     The caller (sast-backend, the single source of truth) supplies the base
     checkpoint, the base config payload, and the data sources explicitly, and is
@@ -20,7 +21,6 @@ import json
 import os
 import subprocess
 import sys
-import threading
 import uuid
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
@@ -68,10 +68,6 @@ class RelearnManager:
     def __init__(self) -> None:
         self._lock = RLock()
         self._jobs: dict[str, RelearnJobState] = {}
-        # Single-slot GPU gate: /relearn spawns a worker thread per submit, but only ONE may
-        # actually train at a time — overlapping submits queue instead of thrashing the GPU
-        # (review #5). Jobs stay "queued" until they acquire this, then flip to "running".
-        self._train_gate = threading.Semaphore(1)
 
     # ── persistence (on-disk, no DB) ──────────────────────────────────────
     def _job_dir(self, job_id: str) -> Path:
@@ -313,11 +309,12 @@ class RelearnManager:
             return ""
 
     # ── job runner ────────────────────────────────────────────────────────
-    def _run_job(self, job: RelearnJobState, train_cfg: Path, importance_cfg: Path | None) -> None:
-        # Serialize on the GPU gate: a concurrent job waits here (staying "queued") until the
-        # active one releases, so two trainings never run at once (review #5).
-        with self._train_gate:
-            self._run_job_locked(job, train_cfg, importance_cfg)
+    def run_job(self, job: RelearnJobState, train_cfg: Path, importance_cfg: Path | None) -> None:
+        # Runs inside the Celery worker process (see app.tasks.run_relearn). Serializing
+        # concurrent trainings is now the worker's job (``--concurrency=1``) instead of an
+        # in-process semaphore, so the heavy train runs in a SEPARATE process from the API —
+        # inference is never starved of CPU by a training.
+        self._run_job_locked(job, train_cfg, importance_cfg)
 
     def _run_job_locked(self, job: RelearnJobState, train_cfg: Path, importance_cfg: Path | None) -> None:
         log = Path(job.log_path) if job.log_path else self._job_dir(job.job_id) / "run.log"
@@ -479,6 +476,56 @@ class RelearnManager:
         (base / "cwe_vocab.json").write_text(json.dumps(vocab, indent=2), encoding="utf-8")
         return len(vocab)
 
+    # Cap on embedding rows returned for the drift baseline: MMD needs ~100 vectors; a full
+    # 1000×D matrix bloats the /evaluate response. Confidence/error are 1 float each, kept whole.
+    _BASELINE_EMB_CAP = 600
+
+    def _read_baseline_from_artifacts(self, results_dir: Path) -> dict[str, Any] | None:
+        """Assemble the drift-baseline signals from a FULL evaluate's research artifacts:
+        per-sample confidence + error (1=wrong/0=correct) from predictions.csv, and the
+        pre-head function embeddings (capped) from embeddings.npz. Returns None when no
+        predictions.csv was produced (e.g. a metrics-only/test-empty run)."""
+        import csv
+
+        import numpy as np
+
+        pred_csv = next(results_dir.glob("**/predictions.csv"), None)
+        if pred_csv is None:
+            return None
+        confidence: list[float] = []
+        error: list[int] = []
+        correct: list[bool] = []
+        with open(pred_csv, newline="", encoding="utf-8") as f:
+            for row in csv.DictReader(f):
+                try:
+                    confidence.append(float(row["confidence"]))
+                except (KeyError, ValueError):
+                    continue
+                is_correct = str(row.get("correct", "")).strip().lower() in ("true", "1")
+                error.append(0 if is_correct else 1)
+                correct.append(is_correct)
+        if not confidence:
+            return None
+
+        emb_list: list[list[float]] = []
+        npz = next(results_dir.glob("**/embeddings.npz"), None)
+        if npz is not None:
+            try:
+                arr = np.load(npz)["embeddings"]
+                if arr.ndim == 2 and arr.shape[0] > 0:
+                    emb_list = [[float(v) for v in r] for r in arr[: self._BASELINE_EMB_CAP].tolist()]
+            except Exception:  # noqa: BLE001 - embeddings are best-effort
+                emb_list = []
+
+        return {
+            "num_samples": len(confidence),
+            "accuracy": (sum(correct) / len(correct)) if correct else None,
+            "confidence": confidence,
+            "error": error,
+            "embeddings": emb_list,
+            "embedding_dim": (len(emb_list[0]) if emb_list else 0),
+        }
+
     # ── evaluation (score an existing checkpoint on a held-out set) ─────────
     def evaluate_checkpoint(
         self,
@@ -563,11 +610,17 @@ class RelearnManager:
         cfg_path = job_dir / "eval.yaml"
         cfg_path.write_text(yaml.safe_dump(cfg, sort_keys=False), encoding="utf-8")
         log = job_dir / "eval.log"
-        env = {**os.environ, "GNN_VULN_API_MODE": "1"}
+        # FULL research path (NOT --metrics-only, and WITHOUT GNN_VULN_API_MODE): the library
+        # writes predictions.csv + embeddings.npz alongside metrics_summary.json. Those ARE the
+        # drift-baseline signals — per-sample confidence + correctness (predictions.csv) and the
+        # pre-head function vectors (embeddings.npz). embeddings.npz holds the SAME vector
+        # predict() returns as cls_embedding, so the MMD baseline is directly comparable to the
+        # embeddings production inference produces (apples-to-apples).
+        env = {k: v for k, v in os.environ.items() if k != "GNN_VULN_API_MODE"}
         with open(log, "a", encoding="utf-8") as lf:
             subprocess.run(
                 [sys.executable, "-m", "gnn_vuln.evaluate", "--checkpoint", str(checkpoint_path),
-                 "--config", str(cfg_path), "--metrics-only"],
+                 "--config", str(cfg_path)],
                 check=True, cwd=str(settings.service_root), env=env,
                 stdout=lf, stderr=subprocess.STDOUT,
             )
@@ -576,14 +629,11 @@ class RelearnManager:
         if summary is None:
             raise RuntimeError(f"evaluation produced no metrics (see {log})")
         data = json.loads(summary.read_text(encoding="utf-8"))
-        # Optional drift-baseline sidecar (per-sample confidence/error + capped embeddings),
-        # written next to metrics_summary.json by the evaluator. Best-effort: absence or a
-        # parse error must not fail the evaluation.
+        # Drift-baseline signals, assembled from the research artifacts the full eval just wrote
+        # (predictions.csv + embeddings.npz). Best-effort: any gap must not fail the evaluation.
         baseline = None
         try:
-            sidecar = summary.parent / "baseline_signals.json"
-            if sidecar.exists():
-                baseline = json.loads(sidecar.read_text(encoding="utf-8"))
+            baseline = self._read_baseline_from_artifacts(job_dir)
         except Exception:  # noqa: BLE001
             baseline = None
         return {
@@ -684,9 +734,14 @@ class RelearnManager:
         )
         job.config_path = str(train_cfg)
         self._save(job)
-        threading.Thread(
-            target=self._run_job, args=(job, train_cfg, importance_cfg), daemon=True
-        ).start()
+        # Hand the heavy training off to the Celery worker (a SEPARATE process). The job spec is
+        # already persisted to disk, so the worker resolves it by id and the API polls status
+        # from disk via GET /relearn/{job_id}. Lazy import avoids a circular import at module load.
+        from app.tasks import run_relearn as _run_relearn_task
+
+        _run_relearn_task.delay(
+            job.job_id, str(train_cfg), str(importance_cfg) if importance_cfg else None
+        )
         return job
 
 

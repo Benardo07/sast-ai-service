@@ -45,12 +45,15 @@ RUN curl -fL "https://github.com/joernio/joern/releases/download/${JOERN_VERSION
     && chmod +x /opt/joern/joern-cli/joern* \
     && test -x /opt/joern/joern-cli/joern-parse
 
-# ── app + vendored gnn_vuln. torch/pyg above already satisfy the heavy deps; the rest
-# (transformers, numpy, boto3, ...) resolve from PyPI via our pyproject. ──
+# ── app + the gnn_vuln model library (installed from PyPI as `gnn-vuln`, NOT vendored).
+# torch/pyg above already satisfy the heavy transitive deps; the rest (transformers, numpy,
+# celery, boto3, ...) resolve from PyPI via our pyproject. ──
 COPY pyproject.toml README.md ./
 COPY app ./app
-COPY gnn_vuln ./gnn_vuln
 RUN uv pip install --system .
 
 EXPOSE 8001
+# API server. The Celery worker runs the SAME image with a different command:
+#   celery -A app.celery_app worker --loglevel=info -Q ai_relearn --concurrency=1
+# (see docker-compose.yml) — long jobs run there, off the API process.
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8001"]

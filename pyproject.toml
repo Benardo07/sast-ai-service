@@ -12,24 +12,14 @@ dependencies = [
     "pyyaml>=6.0.1",
     "boto3>=1.34",
     "httpx>=0.27.0",
-    # ── ML / training stack (vendored gnn_vuln) ──
-    "torch>=2.2.0",
-    "torchvision>=0.17.0",
-    "torch-geometric>=2.5.0",
-    "networkx>=3.3",
     "numpy>=1.26.0",
-    "pandas>=2.2.0",
-    "scikit-learn>=1.4.0",
-    "matplotlib>=3.8.0",
-    "seaborn>=0.13.0",
-    "tqdm>=4.66.0",
-    "tree-sitter>=0.23.0",
-    "tree-sitter-c>=0.23.0",
-    "loguru>=0.7.2",
-    "datasets>=4.8.4",
-    "transformers>=4.48,<5.0",
-    "ijson>=3.5.0",
-    "h5py>=3.16.0",
+    # ── model library (published package, no longer vendored). Brings torch / torch-geometric /
+    # transformers / etc. transitively. torch + torch-scatter/torch-sparse are pre-installed from
+    # their own wheel indexes in the Dockerfile (PyPI alone can't resolve the matching CPU/CUDA
+    # wheels), so those transitive deps are already satisfied when this installs. ──
+    "gnn-vuln==0.1.13",
+    # ── async job queue: long jobs (relearn/train) run in a separate Celery worker + Redis ──
+    "celery[redis]>=5.3",
 ]
 
 [project.optional-dependencies]
@@ -43,4 +33,4 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["app", "gnn_vuln"]
+packages = ["app"]
