@@ -131,6 +131,13 @@ async def relearn(body: RelearnRequest) -> RelearnJobOut:
             device=body.device,
             model_version_id=body.model_version_id,
             run_name=body.run_name,
+            val_dataset=[e.model_dump() for e in body.val_dataset] if body.val_dataset else None,
+            val_source=body.val_source,
+            val_dataset_bundle_uri=body.val_dataset_bundle_uri,
+            test_dataset=[e.model_dump() for e in body.test_dataset] if body.test_dataset else None,
+            test_source=body.test_source,
+            test_dataset_bundle_uri=body.test_dataset_bundle_uri,
+            split=body.split.model_dump(exclude_none=True) if body.split else None,
         )
     except (ValueError, FileNotFoundError) as exc:
         raise HTTPException(status_code=422, detail=str(exc))

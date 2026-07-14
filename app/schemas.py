@@ -80,6 +80,14 @@ class RelearnDatasetEntry(BaseModel):
     model_config = {"extra": "allow"}
 
 
+class RelearnSplit(BaseModel):
+    # Auto-split spec (used only when no val role dataset is provided). Any subset may be set;
+    # omitted keys fall back to the library defaults (0.8 / 0.1 / 42).
+    train_ratio: float | None = None
+    val_ratio: float | None = None
+    seed: int | None = None
+
+
 class RelearnRequest(BaseModel):
     method: str = Field(..., description="finetune | EWC | ER | EWC-ER | retrain")
     base_config: dict = Field(..., description="Base training config payload (from backend ConfigVersion)")
@@ -96,6 +104,17 @@ class RelearnRequest(BaseModel):
     device: str | None = None
     model_version_id: str | None = Field(None, description="Backend-precreated ModelVersion id, for correlation")
     run_name: str | None = None
+    # Role datasets (manual split): a separate VAL (and optional TEST) set. Materialized the same
+    # way as the main dataset. When any val is provided → ROLE mode (library trains 100% of train,
+    # early-stops on val); `split` is then ignored. A TEST set requires a VAL set (library ignores
+    # test-only). Provide inline entries OR a bundle URI per role, not both.
+    val_dataset: list[RelearnDatasetEntry] | None = Field(None, description="Inline CPG dataset for the VALIDATION role")
+    val_source: str | None = Field(None, description="Source name to stage the inline val dataset under")
+    val_dataset_bundle_uri: str | None = Field(None, description="URI (s3://… or path) to a prepared VAL dataset bundle")
+    test_dataset: list[RelearnDatasetEntry] | None = Field(None, description="Inline CPG dataset for the TEST role (requires a val set)")
+    test_source: str | None = Field(None, description="Source name to stage the inline test dataset under")
+    test_dataset_bundle_uri: str | None = Field(None, description="URI (s3://… or path) to a prepared TEST dataset bundle")
+    split: RelearnSplit | None = Field(None, description="Auto-split spec (train_ratio/val_ratio/seed); used only when no val role dataset is given")
 
 
 class EvaluateRequest(BaseModel):

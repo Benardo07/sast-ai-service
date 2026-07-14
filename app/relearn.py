@@ -120,6 +120,9 @@ class RelearnManager:
         device: str | None,
         job_dir: Path,
         materialized: bool = False,
+        val_source: str | None = None,
+        test_source: str | None = None,
+        split: dict | None = None,
     ) -> tuple[Path, Path | None]:
         cfg = copy.deepcopy(base_config)
         cfg.setdefault("data", {})
@@ -157,6 +160,25 @@ class RelearnManager:
                         tv[name] = len(tv)          # new CWE -> extended id (head grows)
             cfg["data"]["target_vocab"] = tv
             cfg.setdefault("model", {})["num_classes"] = len(tv)
+
+        # Train/val/test selection. Role mode (explicit val source) wins: the library sets
+        # use_official = bool(source_val), trains on 100% of train and early-stops on val — so we
+        # must NOT also set train_ratio/val_ratio. A test source is only honored WITH a val source
+        # (library ignores test-only), so drop test_source if val_source is absent. Inline val/test
+        # share the main featurization, so no source_val_params/source_test_params. Otherwise fall
+        # back to the auto-split spec, setting only the keys the caller provided (library defaults
+        # 0.8/0.1/42 fill the rest).
+        if val_source:
+            cfg["data"]["source_val"] = val_source
+            if test_source:
+                cfg["data"]["source_test"] = test_source
+        elif split:
+            if "train_ratio" in split:
+                cfg["data"]["train_ratio"] = split["train_ratio"]
+            if "val_ratio" in split:
+                cfg["data"]["val_ratio"] = split["val_ratio"]
+            if "seed" in split:
+                cfg.setdefault("train", {})["seed"] = split["seed"]
 
         cfg.pop("ewc", None)
         cfg.pop("replay", None)
@@ -663,6 +685,13 @@ class RelearnManager:
         device: str | None = None,
         model_version_id: str | None = None,
         run_name: str | None = None,
+        val_dataset: list[dict] | None = None,
+        val_source: str | None = None,
+        val_dataset_bundle_uri: str | None = None,
+        test_dataset: list[dict] | None = None,
+        test_source: str | None = None,
+        test_dataset_bundle_uri: str | None = None,
+        split: dict | None = None,
     ) -> RelearnJobState:
         if method not in VALID_METHODS:
             raise ValueError(f"Unknown method '{method}'. Allowed: {sorted(VALID_METHODS)}")
@@ -701,6 +730,21 @@ class RelearnManager:
         if not data_source:
             raise ValueError("an inline dataset, a dataset_bundle_uri, or a data_source is required")
 
+        # Role datasets (manual split): materialize VAL/TEST exactly like the main dataset. They
+        # share the main featurization (no source_*_params), so their labels align via target_vocab.
+        val_src: str | None = None
+        if val_dataset:
+            val_src = val_source or f"{data_source}_val"
+            self._write_inline_dataset(val_src, val_dataset, mode)
+        elif val_dataset_bundle_uri:
+            val_src = self._install_bundle(val_dataset_bundle_uri)
+        test_src: str | None = None
+        if test_dataset:
+            test_src = test_source or f"{data_source}_test"
+            self._write_inline_dataset(test_src, test_dataset, mode)
+        elif test_dataset_bundle_uri:
+            test_src = self._install_bundle(test_dataset_bundle_uri)
+
         # Replay / EWC-importance source. When the backend passes the base model's training
         # dataset as a durable bundle (replay_bundle_uri — derived from the champion being
         # relearned, mirroring the reference `base["dataset_id"]` → replay.source), install it
@@ -731,6 +775,9 @@ class RelearnManager:
             device=device,
             job_dir=job_dir,
             materialized=materialized,
+            val_source=val_src,
+            test_source=test_src,
+            split=split,
         )
         job.config_path = str(train_cfg)
         self._save(job)
