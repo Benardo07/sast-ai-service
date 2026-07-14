@@ -29,6 +29,8 @@ class Settings(BaseSettings):
     s3_secret_key: str = "minioadmin"
     s3_region: str = "us-east-1"
     s3_bucket_checkpoints: str = "checkpoints"
+    # Built .pt dataset bundles (s3://datasets/builds/<key>.tar.gz) — reused by later relearns.
+    s3_bucket_datasets: str = "datasets"
     # Local cache for checkpoints downloaded from object storage.
     checkpoint_cache_dir: str = "./var/checkpoint-cache"
     # Cap on cached checkpoint dirs (LRU-evicted by last-access). 0 = unbounded (review #16).

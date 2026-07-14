@@ -58,6 +58,27 @@ class RelearnJobState:
     class_names: list[str] | None = None
     model_version_id: str | None = None
     message: str | None = None
+    # Dataset-bundle export (durable .pt builds). `materialized` = the dataset was built under
+    # this service's data root, so there is a .pt to export; `export_bundle_key` is the
+    # backend's <dataset_key>-<build_key>. The last three are filled after a successful train.
+    materialized: bool = False
+    export_bundle_key: str | None = None
+    exported_bundle_uri: str | None = None
+    ds_name: str | None = None
+    num_graphs: int | None = None
+    # Durable EWC importance. `imported_importance` = submit() pre-seeded the base version's
+    # cached importance into the stage dir, so this run computes nothing and exports nothing.
+    # `exported_importance_uri` is filled only when we DID run the pass and uploaded the result.
+    imported_importance: bool = False
+    exported_importance_uri: str | None = None
+    # Cumulative replay pool (>1 ancestor bundle). submit() does NOT install or merge these:
+    # installing tens of thousands of lazy graphs + a merge is far outside the backend's 300s
+    # `POST /relearn` timeout, and blowing it splits the brain (backend fails the run while this
+    # service keeps training). submit() only DERIVES the pool name from the URIs and persists the
+    # plan here; `_run_job_locked` installs + merges in the Celery worker, where there is no clock.
+    # Both fields must survive the process hop to the worker (same reason as `imported_importance`).
+    replay_pool_uris: list[str] | None = None
+    replay_pool_source: str | None = None
     created_at: str = field(default_factory=_utc_now_iso)
     updated_at: str = field(default_factory=_utc_now_iso)
 
@@ -123,6 +144,8 @@ class RelearnManager:
         val_source: str | None = None,
         test_source: str | None = None,
         split: dict | None = None,
+        importance_source: str | None = None,
+        pool_merged: bool = False,
     ) -> tuple[Path, Path | None]:
         cfg = copy.deepcopy(base_config)
         cfg.setdefault("data", {})
@@ -208,19 +231,40 @@ class RelearnManager:
                 "n_batches": 0,
             }
 
+            # Experience replay (Chaudhry 2019): `replay_source` is the base model's CUMULATIVE
+            # lineage pool (merged in submit()), NOT the t-1 dataset — episodic memory spans every
+            # past task, else the 3rd generation forgets task A.
             if method in _REPLAY_METHODS and replay_source:
+                # A merged pool REBUILDS the vocab as ["benign"] + sorted(rest) (gnn_vuln
+                # data/merge.py:72-74), while our head is FREQUENCY-ordered. Without an explicit
+                # target_vocab the replay buffer would feed correctly-embedded graphs under WRONG
+                # label ids — silently replaying the wrong CWEs, corrupting exactly what ER
+                # protects. No best-effort here: fail the job.
+                if pool_merged and not cfg["data"].get("target_vocab"):
+                    raise ValueError(
+                        "merged replay pool requires data.target_vocab (the base model's class "
+                        "space): the merge rebuilds the label space alphabetically while the base "
+                        "head is frequency-ordered, so replaying without it corrupts labels. "
+                        "Pass base_class_names for this relearn, or send a single replay bundle."
+                    )
                 cfg["replay"] = {
                     "enabled": True,
                     "source": replay_source,
                     "buffer_per_class": 50,
                     "weight": 1.0,
                     "buffer_seed": 42,
+                    # Explicit even though _setup_replay's `_rd` would inherit both from cfg.data —
+                    # this is where a future reader looks, and the vocab one is load-bearing.
+                    "storage": cfg["data"].get("storage", "inmemory"),
+                    "target_vocab": cfg["data"].get("target_vocab"),
                 }
 
-            # EWC importance pass (task-A data) if cache missing.
-            if method in _EWC_METHODS and replay_source and cache and not Path(cache).exists():
+            # EWC importance pass over the t-1 dataset ONLY (EWC-DR Eq(1)) — never the cumulative
+            # pool: protection of older tasks is transitive via the anchor. Skipped when the
+            # backend pre-seeded the base version's cached importance at `cache`.
+            if method in _EWC_METHODS and importance_source and cache and not Path(cache).exists():
                 imp = copy.deepcopy(cfg)
-                imp.setdefault("data", {})["source"] = replay_source
+                imp.setdefault("data", {})["source"] = importance_source
                 imp["ewc"] = {**cfg["ewc"], "weight": 1000.0, "compute_only": True}
                 imp.pop("replay", None)
                 importance_cfg_path = job_dir / "importance.yaml"
@@ -349,6 +393,12 @@ class RelearnManager:
             job.status = "running"
             self._save(job)
             with open(log, "w", encoding="utf-8") as lf:
+                # Cumulative replay pool: install the ancestor bundles + merge them HERE, where
+                # there is no HTTP clock (submit() only planned it — see RelearnJobState). Must
+                # precede the importance pass and the train: both read the pool by name. Any
+                # failure propagates and fails the job — no fallback to single-bundle replay.
+                if job.replay_pool_uris and len(job.replay_pool_uris) > 1:
+                    self._install_and_merge_replay_pool(job, lf, log)
                 if importance_cfg is not None:
                     lf.write(f"== EWC importance: {importance_cfg} ==\n")
                     lf.flush()
@@ -357,6 +407,28 @@ class RelearnManager:
                         check=True, cwd=str(settings.service_root), env=env,
                         stdout=lf, stderr=subprocess.STDOUT,
                     )
+                    # We just paid for the importance pass over the task-A dataset, so publish it:
+                    # it is a pure function of the BASE version's immutable (checkpoint, dataset),
+                    # and the backend caches the URI on that version so no future EWC relearn off
+                    # the same base pays again. Done here rather than after training — the
+                    # importance is valid whether or not the subsequent train succeeds.
+                    # Best-effort, like the checkpoint upload below: an upload failure must never
+                    # fail an otherwise-successful job; the next run simply recomputes.
+                    cache = self._job_dir(job.job_id) / "base" / "ewc_importance.pt"
+                    if cache.exists() and not job.imported_importance and storage.using_s3():
+                        try:
+                            job.exported_importance_uri = storage.put_file(
+                                settings.s3_bucket_checkpoints,
+                                f"importance/{job.job_id}.ewc_importance.pt",
+                                cache,
+                            )
+                            lf.write(f"== EWC importance exported: {job.exported_importance_uri} ==\n")
+                        except Exception as e:  # noqa: BLE001
+                            lf.write(
+                                f"WARN EWC importance upload to object storage failed: "
+                                f"{type(e).__name__}: {e}\n"
+                            )
+                        lf.flush()
                 lf.write(f"== train: {train_cfg} ==\n")
                 lf.flush()
                 subprocess.run(
@@ -419,6 +491,11 @@ class RelearnManager:
                     except Exception as e:  # noqa: BLE001 - keep local path if upload fails
                         with open(log, "a", encoding="utf-8") as lf:
                             lf.write(f"WARN checkpoint upload to object storage failed: {type(e).__name__}: {e}\n")
+                # Durable .pt build: push the dataset we just embedded to object storage so the
+                # next relearn on the same raw set + featurization reuses it (the CPGs are cached,
+                # the unixcoder embedding pass is not). Best-effort — never fails a good train.
+                if job.export_bundle_key and job.materialized:
+                    self._export_dataset_bundle(job, train_cfg, log)
                 job.status = "done"
         except subprocess.CalledProcessError as e:
             tail = self._log_tail(log)
@@ -429,6 +506,94 @@ class RelearnManager:
             job.status = "failed"
             job.message = f"{type(e).__name__}: {e}"
         self._save(job)
+
+    def _export_dataset_bundle(self, job: RelearnJobState, train_cfg: Path, log: Path) -> None:
+        """Inverse of `_install_bundle`: tar.gz the built gnn_vuln dataset and upload it to
+        `<datasets>/builds/<export_bundle_key>.tar.gz`, recording the uri + ds_name (+ n_graphs)
+        on the job. Emits exactly the layout _install_bundle consumes:
+            data/raw/<source>/cwe_vocab.json          (also how it recovers the source name)
+            data/processed/<ds_name>_meta.pt + <ds_name>_graphs/**   (lazy storage)
+            data/processed/<ds_name>.pt                              (inmemory storage)
+        Best-effort: any failure is logged and leaves the successful job untouched."""
+        import shutil
+        import tarfile
+        import tempfile
+
+        def _warn(msg: str) -> None:
+            with open(log, "a", encoding="utf-8") as lf:
+                lf.write(f"WARN dataset bundle export: {msg}\n")
+
+        try:
+            source = job.data_source
+            processed = settings.data_root / "processed"
+            try:
+                cfg = yaml.safe_load(train_cfg.read_text(encoding="utf-8")) or {}
+            except Exception:  # noqa: BLE001
+                cfg = {}
+            mode = (cfg.get("data") or {}).get("mode", "multiclass")
+            # Pin the mode segment right after the source: the role sources are named
+            # <source>_val / <source>_test, so a bare `lm_dataset_<source>_*` would match them too.
+            newest = lambda ps: sorted(ps, key=lambda p: p.stat().st_mtime, reverse=True)  # noqa: E731
+            metas = newest(processed.glob(f"lm_dataset_{source}_{mode}_*_meta.pt"))
+            if metas:
+                lazy, ds_name = True, metas[0].name[: -len("_meta.pt")]
+            else:
+                flat = newest(
+                    p for p in processed.glob(f"lm_dataset_{source}_{mode}_*.pt")
+                    if not p.name.endswith("_meta.pt")
+                )
+                if not flat:
+                    _warn(f"no built .pt for source '{source}' under {processed} — skipped")
+                    return
+                lazy, ds_name = False, flat[0].stem
+
+            num_graphs: int | None = None
+            if lazy:  # the meta is a tiny {"n_graphs", "class_names"} dict; the inmemory .pt is not
+                try:
+                    import torch
+
+                    meta = torch.load(processed / f"{ds_name}_meta.pt", weights_only=False)
+                    if isinstance(meta, dict) and meta.get("n_graphs") is not None:
+                        num_graphs = int(meta["n_graphs"])
+                except Exception:  # noqa: BLE001
+                    num_graphs = None
+
+            # s3 mode: a temp tar, deleted right after upload (bundles are GBs, VM disk is tight).
+            # fs mode: put_file returns the path itself, so it must survive — keep it under data_root.
+            if storage.using_s3():
+                tar_dir = Path(tempfile.mkdtemp(prefix="ds_bundle_"))
+            else:
+                tar_dir = settings.data_root / "bundles"
+                tar_dir.mkdir(parents=True, exist_ok=True)
+            tar_path = tar_dir / f"{job.export_bundle_key}.tar.gz"
+            try:
+                with tarfile.open(tar_path, "w:gz") as tf:
+                    vocab = settings.data_root / "raw" / source / "cwe_vocab.json"
+                    if vocab.exists():
+                        tf.add(vocab, arcname=f"data/raw/{source}/cwe_vocab.json")
+                    else:
+                        _warn(f"no cwe_vocab.json for source '{source}' (source inferred on install)")
+                    if lazy:
+                        tf.add(processed / f"{ds_name}_meta.pt", arcname=f"data/processed/{ds_name}_meta.pt")
+                        tf.add(processed / f"{ds_name}_graphs", arcname=f"data/processed/{ds_name}_graphs")
+                    else:
+                        tf.add(processed / f"{ds_name}.pt", arcname=f"data/processed/{ds_name}.pt")
+                uri = storage.put_file(
+                    settings.s3_bucket_datasets, f"builds/{job.export_bundle_key}.tar.gz", tar_path
+                )
+            finally:
+                if storage.using_s3():
+                    shutil.rmtree(tar_dir, ignore_errors=True)
+            job.exported_bundle_uri = uri
+            job.ds_name = ds_name
+            job.num_graphs = num_graphs
+            with open(log, "a", encoding="utf-8") as lf:
+                lf.write(f"== dataset bundle exported: {uri} (ds_name={ds_name}, n_graphs={num_graphs}) ==\n")
+        except Exception as e:  # noqa: BLE001 - export never fails a successful training
+            try:
+                _warn(f"{type(e).__name__}: {e}")
+            except Exception:  # noqa: BLE001
+                pass
 
     # ── submission ──────────────────────────────────────────────────────
     def _install_bundle(self, uri: str) -> str:
@@ -460,6 +625,171 @@ class RelearnManager:
         if not source:
             raise ValueError("Could not determine data_source from bundle (no data/raw/<source> or processed .pt)")
         return source
+
+    @staticmethod
+    def _pool_source_name(uris: list[str]) -> str:
+        """The cumulative replay pool's source name, derived from the ordered ancestor bundle
+        URIs — NOT from their installed source names, which are only knowable after downloading
+        multi-GB tarballs. That is the whole point: submit() must name the pool without paying
+        for it, so the name it writes into `train.yaml`'s `replay.source` and the name the worker
+        later passes to `--out-source` are the same string by construction.
+
+        The pool is ordered, so the hash is order-sensitive. No underscore in the name:
+        `_ds_name` is `lm_dataset_{source}_{mode}_...` and `_install_bundle`'s fallback splits on
+        "_" — same rule as `dsv-`.
+        """
+        import hashlib
+
+        return "pool-" + hashlib.sha256("|".join(uris).encode()).hexdigest()[:12]
+
+    def _write_merge_config(self, cfg: dict[str, Any], job_dir: Path) -> Path:
+        """Write `replay_merge.yaml` — the cfg half of the merge. Called from submit() (cheap: it
+        only reshuffles the base config, no I/O beyond one small file) so a config that can never
+        merge fails the HTTP request instead of a queued job. The `--sources` / `--out-source` half
+        is CLI args the worker supplies once the bundles are actually installed."""
+        data_cfg = cfg.get("data") or {}
+
+        # gnn_vuln 0.1.15 cannot merge cwe_list/cwe_groups-filtered datasets: both `_build_ds` and
+        # `_out_processed_path` (merge.py:33-47,157) drop these two when deriving `_ds_name`
+        # (`_filter_suffix(None, None, ...)`), while the real dataset — and therefore
+        # `_setup_replay` — folds them into `_fsuffix` (dataset_lm.py:423). The merge would read
+        # and write .pt names the trainer then cannot resolve, and die rebuilding from raw CPG.
+        # filter_owasp/filter_top25_dangerous ARE forwarded and merge fine. Fail early and clearly.
+        if data_cfg.get("cwe_list") or data_cfg.get("cwe_groups"):
+            raise ValueError(
+                "cannot merge a cumulative replay pool for a config with data.cwe_list or "
+                "data.cwe_groups: gnn_vuln's merge ignores both when resolving the dataset name, "
+                "so the merged pool would be unreadable by the trainer. Send a single "
+                "replay_bundle_uri for this model, or drop the cwe_list/cwe_groups filter."
+            )
+
+        # Mirror cfg's NAME-DETERMINING params exactly: merge resolves the output path via the same
+        # `_ds_name` that `_setup_replay` (through `_rd`'s cfg.data fallback) will resolve when it
+        # loads the pool. Any drift here and the trainer looks for a file the merge never wrote.
+        # Keys absent from cfg stay absent, so both sides take the same library default.
+        model_cfg = cfg.get("model") or {}
+        merge_cfg: dict[str, Any] = {
+            "data": {
+                k: data_cfg[k]
+                for k in (
+                    "mode", "max_nodes", "top_cwe", "cwe_list", "cwe_groups", "filter_owasp",
+                    "filter_top25_dangerous", "max_per_class", "resample_seed", "storage",
+                    "ds_name_suffix",
+                )
+                if k in data_cfg
+            },
+            "model": {
+                k: model_cfg[k]
+                for k in ("pretrained_lm", "func_lm", "func_lm_source", "add_func_tokens",
+                          "func_max_length")
+                if k in model_cfg
+            },
+        }
+        merge_cfg["data"]["raw_dir"] = str(settings.data_root / "raw")       # merge writes the
+        merge_cfg["data"]["processed_dir"] = str(settings.data_root / "processed")  # unified vocab
+        merge_yaml = job_dir / "replay_merge.yaml"
+        merge_yaml.write_text(yaml.safe_dump(merge_cfg, sort_keys=False), encoding="utf-8")
+        return merge_yaml
+
+    def _install_and_merge_replay_pool(self, job: RelearnJobState, lf: Any, log: Path) -> None:
+        """Worker-side half of the cumulative replay pool: install the ancestor bundles and merge
+        them into `job.replay_pool_source`. Runs in the Celery worker, NOT in submit() — installing
+        N multi-GB bundles (a torch.load + torch.save per lazy graph) cannot fit the backend's 300s
+        `POST /relearn` timeout.
+
+        The out-source is READ FROM THE JOB, never recomputed: submit() already wrote that exact
+        string into `train.yaml`'s `replay.source`, and the trainer will look for a pool under
+        precisely that name. Recomputing the hash here would be a second source of truth.
+
+        Raises on any failure — a job whose pool did not merge must fail loudly rather than fall
+        back to single-bundle replay, which would silently restore the 1-generation forgetting this
+        pool exists to fix and quietly invalidate the run's numbers.
+        """
+        uris = job.replay_pool_uris or []
+        out_source = job.replay_pool_source
+        if not out_source:
+            raise RuntimeError("replay pool requested but job.replay_pool_source is unset")
+        merge_yaml = self._job_dir(job.job_id) / "replay_merge.yaml"
+        if not merge_yaml.exists():
+            raise RuntimeError(f"replay pool merge config missing: {merge_yaml}")
+
+        lf.write(f"== replay pool {out_source}: installing {len(uris)} ancestor bundle(s) ==\n")
+        lf.flush()
+        sources: list[str] = []
+        for uri in uris:
+            s = self._install_bundle(uri)
+            if s not in sources:            # dedup source names, preserve pool order
+                sources.append(s)
+            lf.write(f"== installed {uri} -> {s} ==\n")
+            lf.flush()
+        self._merge_replay_pool(sources, out_source, merge_yaml, lf, log)
+
+    def _merge_replay_pool(
+        self, sources: list[str], out_source: str, merge_yaml: Path, lf: Any, log: Path
+    ) -> str:
+        """Merge the base model's ordered ancestor datasets into ONE cumulative replay pool at the
+        processed .pt level (gnn_vuln.data.merge — concatenate finished .pt + unify the vocab; no
+        Joern, no re-embedding) under the caller-supplied `out_source`."""
+        try:
+            merge_cfg = yaml.safe_load(merge_yaml.read_text(encoding="utf-8")) or {}
+        except Exception:  # noqa: BLE001
+            merge_cfg = {}
+        mode = (merge_cfg.get("data") or {}).get("mode", "multiclass")
+        processed = settings.data_root / "processed"
+
+        # Preflight: merge's `_build_ds` LOADS each source, but a miss silently falls through to
+        # BUILDING it from raw CPG — i.e. the Joern wall, failing minutes later with a confusing
+        # error. Lives here (not in submit) because it needs the sources INSTALLED to check them.
+        # Mode-pinned glob (a bare `<source>_*` also matches `<source>_val`/`<source>_test`).
+        for s in sources:
+            if not any(processed.glob(f"lm_dataset_{s}_{mode}_*")):
+                raise ValueError(
+                    f"replay pool source '{s}' has no built dataset under {processed} "
+                    f"(expected lm_dataset_{s}_{mode}_*.pt or _meta.pt). Its bundle installed no "
+                    f"processed .pt, so merging it would try to rebuild from raw CPG."
+                )
+
+        # Idempotent: the pool is a pure function of (ordered sources, featurization), both of which
+        # the output path encodes — so an existing one is reusable as-is. Resolved through the
+        # library's own helper off the yaml submit() wrote (the same load the subprocess does), so
+        # the check can never disagree with the merge. Best-effort: if it throws, just merge again.
+        try:
+            from gnn_vuln.config import Config
+            from gnn_vuln.data.merge import _out_processed_path
+
+            out_path = _out_processed_path(
+                settings.data_root, out_source, Config.from_yamls([str(merge_yaml)])
+            )
+            if out_path.exists():
+                lf.write(f"== replay pool {out_source} already merged ({out_path}) — reused ==\n")
+                lf.flush()
+                return out_source
+        except Exception as e:  # noqa: BLE001
+            lf.write(f"WARN replay pool reuse check failed ({type(e).__name__}: {e}) — merging\n")
+            lf.flush()
+
+        # `--dedup` drops duplicate functions by `raw_func` hash (merge.py:48-52); a graph without
+        # `raw_func` is silently kept. Fine here: `_write_inline_dataset` always writes raw_func and
+        # lazy `torch.save(g, ...)` round-trips the whole Data.
+        lf.write(f"== merge replay pool -> {out_source} from {sources} ==\n")
+        lf.flush()
+        try:
+            subprocess.run(
+                [sys.executable, "-m", "gnn_vuln.data.merge", "--config", str(merge_yaml),
+                 "--sources", *sources, "--out-source", out_source, "--dedup"],
+                check=True, cwd=str(settings.service_root),
+                env={**os.environ, "GNN_VULN_API_MODE": "1"},
+                stdout=lf, stderr=subprocess.STDOUT,
+            )
+        except subprocess.CalledProcessError as e:
+            # NO fallback to single-bundle replay: that would silently restore the 1-generation
+            # behavior this pool exists to fix, and quietly invalidate the run's numbers.
+            lf.flush()   # the tail we are about to read is still in our own buffer
+            raise RuntimeError(
+                f"replay pool merge failed (exit {e.returncode}) for sources {sources}:\n"
+                f"{self._log_tail(log)}"
+            ) from e
+        return out_source
 
     def _write_inline_dataset(self, source: str, entries: list[dict], mode: str) -> int:
         """Write materialized CPG entries to data_root/raw/<source>/{benign,vulnerable}
@@ -682,6 +1012,8 @@ class RelearnManager:
         base_class_names: list[str] | None = None,
         replay_source: str | None = None,
         replay_bundle_uri: str | None = None,
+        replay_bundle_uris: list[str] | None = None,
+        ewc_importance_uri: str | None = None,
         device: str | None = None,
         model_version_id: str | None = None,
         run_name: str | None = None,
@@ -692,6 +1024,7 @@ class RelearnManager:
         test_source: str | None = None,
         test_dataset_bundle_uri: str | None = None,
         split: dict | None = None,
+        export_bundle_key: str | None = None,
     ) -> RelearnJobState:
         if method not in VALID_METHODS:
             raise ValueError(f"Unknown method '{method}'. Allowed: {sorted(VALID_METHODS)}")
@@ -745,13 +1078,88 @@ class RelearnManager:
         elif test_dataset_bundle_uri:
             test_src = self._install_bundle(test_dataset_bundle_uri)
 
-        # Replay / EWC-importance source. When the backend passes the base model's training
-        # dataset as a durable bundle (replay_bundle_uri — derived from the champion being
-        # relearned, mirroring the reference `base["dataset_id"]` → replay.source), install it
-        # here and use its source name. This overrides any manual replay_source and is what
-        # makes EWC/ER actually protect task-A knowledge. No-op for finetune/retrain.
+        # TWO DISTINCT SOURCES — do not collapse them:
+        #   importance_source = the t-1 base dataset, ALWAYS a single bundle. EWC-DR Eq(1) takes
+        #     the Fisher from task t-1 only; older tasks are protected transitively via the anchor.
+        #     Computing it over the cumulative pool would violate the method.
+        #   replay_source     = the base's CUMULATIVE lineage (Chaudhry 2019 episodic memory over
+        #     ALL past tasks), merged from the ancestor bundles. With only t-1, the 3rd generation
+        #     loses task A.
+        # Both are installed from durable bundles derived by the backend from the champion being
+        # relearned, and override any manual replay_source. No-op for finetune/retrain.
+        # Captured BEFORE replay_source is reassigned to the pool below: a caller that passes only
+        # a manual replay_source (no bundles) keeps today's behavior — that source drives the
+        # importance pass. A bundle overrides it.
+        importance_source: str | None = (
+            replay_source if method in (_REPLAY_METHODS | _EWC_METHODS) else None
+        )
+        # The t-1 bundle is normally also the pool's last entry — install each URI at most once
+        # (they are multi-GB tarballs to fetch and extract).
+        _installed: dict[str, str] = {}
+
+        def _install(uri: str) -> str:
+            if uri not in _installed:
+                _installed[uri] = self._install_bundle(uri)
+            return _installed[uri]
+
         if replay_bundle_uri and method in (_REPLAY_METHODS | _EWC_METHODS):
-            replay_source = self._install_bundle(replay_bundle_uri)
+            importance_source = _install(replay_bundle_uri)
+
+        # Cumulative replay pool. submit() runs INSIDE the backend's 300s `POST /relearn` request,
+        # so it must stay cheap: installing the ancestor bundles (tens of thousands of lazy graphs,
+        # a torch.load + torch.save each, times N ancestors) and merging them would blow that budget
+        # and split the brain — the backend would time out and fail the run while this service kept
+        # working. So the >1 case only PLANS the pool here and defers the work to the worker.
+        pool_merged = False
+        replay_pool_uris: list[str] | None = None
+        replay_pool_source: str | None = None
+        if method in _REPLAY_METHODS:
+            uris = list(dict.fromkeys(replay_bundle_uris or []))     # dedup, preserve pool order
+            if not uris and replay_bundle_uri:
+                uris = [replay_bundle_uri]                           # single-ancestor / legacy caller
+            if len(uris) > 1:
+                # Name the pool from the URIs, not the installed source names: the latter are only
+                # knowable by downloading the bundles, which is exactly what we are deferring.
+                replay_pool_uris = uris
+                replay_pool_source = self._pool_source_name(uris)
+                pool_merged = True
+                # Fails the request now if the config can never merge (cwe_list/cwe_groups).
+                self._write_merge_config(base_config, job_dir)
+            elif uris:
+                # Single bundle: unchanged — install here and use its source name.
+                replay_source = _install(uris[0])
+            # else: no bundles — keep the caller-supplied manual replay_source as-is.
+
+        # Durable EWC importance: the base version's Fisher/importance is a pure function of
+        # (base checkpoint, base replay dataset, scope="all", n_batches=0) — all immutable — so the
+        # backend caches it per version and hands it back here. Pre-seed it at exactly the path
+        # `_build_train_config` puts in cfg.ewc.importance_cache; that function's cache-exists guard
+        # then skips emitting importance.yaml, and gnn_vuln's train.py::_setup_ewc loads it via
+        # EWCDR.from_file instead of running the ~1h pass over the task-A dataset.
+        imported_importance = False
+        if ewc_importance_uri and method in _EWC_METHODS:
+            # MUST match `_build_train_config`'s stage_dir (`job_dir / "base"`) — that coupling is
+            # load-bearing: a mismatch silently re-runs the pass. `mkdir(exist_ok=True)` there makes
+            # pre-creating it safe.
+            try:
+                stage_dir = job_dir / "base"
+                stage_dir.mkdir(parents=True, exist_ok=True)
+                import shutil
+
+                local = storage.ensure_local(ewc_importance_uri)  # downloads if s3://, else resolves
+                shutil.copy2(local, stage_dir / "ewc_importance.pt")
+                imported_importance = True
+            except Exception as e:  # noqa: BLE001 - never fail a job over a cache miss
+                # Worst case the importance pass just runs again — correct, only slower. Warn into
+                # a sibling of run.log, which `_run_job_locked` opens with "w" (would truncate this).
+                try:
+                    (job_dir / "submit.log").write_text(
+                        f"WARN EWC importance cache fetch failed ({ewc_importance_uri}): "
+                        f"{type(e).__name__}: {e}\n",
+                        encoding="utf-8",
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
 
         job = RelearnJobState(
             job_id=job_id,
@@ -762,7 +1170,17 @@ class RelearnManager:
             log_path=str(job_dir / "run.log"),
             model_version_id=model_version_id,
             message=run_name,
+            materialized=materialized,
+            export_bundle_key=export_bundle_key,
+            imported_importance=imported_importance,
+            replay_pool_uris=replay_pool_uris,
+            replay_pool_source=replay_pool_source,
         )
+        # THE INVARIANT: the pool name written into `train.yaml`'s `replay.source` here must be
+        # byte-identical to the `--out-source` the worker later merges to, or the trainer looks for
+        # a pool that does not exist. Both sides read `job.replay_pool_source` — one hash, computed
+        # once, carried on the job across the process hop. Never recompute it.
+        replay_source_final = job.replay_pool_source or replay_source
         train_cfg, importance_cfg = self._build_train_config(
             method=method,
             base_config=base_config,
@@ -771,13 +1189,15 @@ class RelearnManager:
             epochs=epochs,
             base_checkpoint_path=base_checkpoint_path,
             base_class_names=base_class_names,
-            replay_source=replay_source,
+            replay_source=replay_source_final,
             device=device,
             job_dir=job_dir,
             materialized=materialized,
             val_source=val_src,
             test_source=test_src,
             split=split,
+            importance_source=importance_source,
+            pool_merged=pool_merged,
         )
         job.config_path = str(train_cfg)
         self._save(job)

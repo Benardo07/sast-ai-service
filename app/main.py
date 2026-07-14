@@ -128,6 +128,8 @@ async def relearn(body: RelearnRequest) -> RelearnJobOut:
             base_class_names=body.base_class_names,
             replay_source=body.replay_source,
             replay_bundle_uri=body.replay_bundle_uri,
+            replay_bundle_uris=body.replay_bundle_uris,
+            ewc_importance_uri=body.ewc_importance_uri,
             device=body.device,
             model_version_id=body.model_version_id,
             run_name=body.run_name,
@@ -138,6 +140,7 @@ async def relearn(body: RelearnRequest) -> RelearnJobOut:
             test_source=body.test_source,
             test_dataset_bundle_uri=body.test_dataset_bundle_uri,
             split=body.split.model_dump(exclude_none=True) if body.split else None,
+            export_bundle_key=body.export_bundle_key,
         )
     except (ValueError, FileNotFoundError) as exc:
         raise HTTPException(status_code=422, detail=str(exc))

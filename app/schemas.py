@@ -100,7 +100,9 @@ class RelearnRequest(BaseModel):
     base_checkpoint_path: str | None = Field(None, description="Task-A checkpoint (.pt) for finetune/EWC/ER/EWC-ER")
     base_class_names: list[str] | None = Field(None, description="Base model's ordered class names. When continuing a base model, task-B labels are remapped onto this class space (known CWEs keep their id, new CWEs extend the head).")
     replay_source: str | None = Field(None, description="Task-A data source for replay / EWC importance")
-    replay_bundle_uri: str | None = Field(None, description="URI (s3://… or path) to the base model's training dataset bundle (.tar.gz of the gnn_vuln data/ layout). Installed into the data root and used as the replay/EWC source — the durable equivalent of replay_source, derived by the backend from the champion being relearned.")
+    replay_bundle_uri: str | None = Field(None, description="URI (s3://… or path) to the t−1 base model's training dataset bundle (.tar.gz of the gnn_vuln data/ layout). Installed into the data root and used as the EWC importance source (EWC-DR Eq(1) takes importance from task t−1 ONLY) and as the single-source replay fallback when no replay_bundle_uris are given. Derived by the backend from the champion being relearned.")
+    replay_bundle_uris: list[str] | None = Field(None, description="Ordered ancestor dataset bundles (oldest first) forming the base model's CUMULATIVE experience-replay pool (Chaudhry 2019 episodic memory over all past tasks). Merged at the .pt level into one pool dataset used as replay.source. Replay methods (ER/EWC-ER) only. When omitted, replay falls back to [replay_bundle_uri]. Never used for the EWC importance pass.")
+    ewc_importance_uri: str | None = Field(None, description="URI (s3://… or path) to the base version's cached EWC-DR importance (.pt). Pre-seeded into the job's base stage dir so the ~1h importance pass over the task-A dataset is skipped. Ignored for non-EWC methods. Best-effort: an unreachable URI just means the pass runs again.")
     device: str | None = None
     model_version_id: str | None = Field(None, description="Backend-precreated ModelVersion id, for correlation")
     run_name: str | None = None
@@ -115,6 +117,7 @@ class RelearnRequest(BaseModel):
     test_source: str | None = Field(None, description="Source name to stage the inline test dataset under")
     test_dataset_bundle_uri: str | None = Field(None, description="URI (s3://… or path) to a prepared TEST dataset bundle")
     split: RelearnSplit | None = Field(None, description="Auto-split spec (train_ratio/val_ratio/seed); used only when no val role dataset is given")
+    export_bundle_key: str | None = Field(None, description="When set (and the dataset is materialized here), the built .pt dataset is exported after a successful training to s3://<datasets>/builds/<key>.tar.gz so a later relearn on the same raw set + featurization can reuse it instead of re-embedding.")
 
 
 class EvaluateRequest(BaseModel):
@@ -165,5 +168,14 @@ class RelearnJobOut(BaseModel):
     class_names: list[str] | None = None
     model_version_id: str | None = None
     message: str | None = None
+    # Set only when the run exported its built dataset (export_bundle_key + a locally built .pt).
+    # The backend records these as a DatasetBuild + the new version's replay bundle.
+    exported_bundle_uri: str | None = None
+    ds_name: str | None = None
+    num_graphs: int | None = None
+    # Set only when THIS run computed a fresh EWC importance (i.e. no `ewc_importance_uri` was
+    # supplied and the importance pass actually ran). The backend caches it on the BASE version
+    # so no later EWC relearn off that base pays for the pass again.
+    exported_importance_uri: str | None = None
     created_at: str | None = None
     updated_at: str | None = None
