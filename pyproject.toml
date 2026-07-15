@@ -17,7 +17,7 @@ dependencies = [
     # transformers / etc. transitively. torch + torch-scatter/torch-sparse are pre-installed from
     # their own wheel indexes in the Dockerfile (PyPI alone can't resolve the matching CPU/CUDA
     # wheels), so those transitive deps are already satisfied when this installs. ──
-    "gnn-vuln==0.1.15",
+    "gnn-vuln==0.1.16",
     # ── async job queue: long jobs (relearn/train) run in a separate Celery worker + Redis ──
     "celery[redis]>=5.3",
 ]

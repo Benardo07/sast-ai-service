@@ -358,8 +358,18 @@ class RelearnManager:
 
     def _parse_metrics(self, checkpoint: Path, results_dir: Path | None = None) -> dict[str, Any] | None:
         """Best-effort: read training_summary.json + metrics_summary.json near the
-        checkpoint / results dir, merging all scalar numeric metrics found."""
-        search_dirs = [checkpoint.parent, results_dir, settings.results_root]
+        checkpoint / results dir, merging all scalar numeric metrics found.
+
+        ONLY this job's own directories are searched. `settings.results_root` used to be a third
+        fallback, but it is GLOBAL: its newest summary belongs to whatever ran last, and because
+        the merge below is last-wins it silently overwrote the job's real numbers. That is not
+        hypothetical — graph_based v2 (job 20260715_085830_3bd257) was registered with
+        confidence_mean/num_classes/num_test_samples taken from a seqgnn run five days older,
+        mixed with its own localization metrics, because those keys were null in the intruder and
+        so survived. A version with no metrics is honest; a version wearing another model's
+        numbers is what someone promotes to production on.
+        """
+        search_dirs = [checkpoint.parent, results_dir]
         filenames = ("training_summary.json", "metrics_summary.json")
         metrics: dict[str, float] = {}
         for d in search_dirs:
@@ -663,18 +673,51 @@ class RelearnManager:
         is CLI args the worker supplies once the bundles are actually installed."""
         data_cfg = cfg.get("data") or {}
 
-        # gnn_vuln 0.1.15 cannot merge cwe_list/cwe_groups-filtered datasets: both `_build_ds` and
-        # `_out_processed_path` (merge.py:33-47,157) drop these two when deriving `_ds_name`
-        # (`_filter_suffix(None, None, ...)`), while the real dataset — and therefore
-        # `_setup_replay` — folds them into `_fsuffix` (dataset_lm.py:423). The merge would read
-        # and write .pt names the trainer then cannot resolve, and die rebuilding from raw CPG.
-        # filter_owasp/filter_top25_dangerous ARE forwarded and merge fine. Fail early and clearly.
-        if data_cfg.get("cwe_list") or data_cfg.get("cwe_groups"):
+        # The merge is only safe while BOTH halves derive the same `_ds_name`. gnn_vuln <0.1.16
+        # dropped cwe_list/cwe_groups outright, so any filtered config was unmergeable; 0.1.16
+        # forwards them in `_build_ds` (merge.py:47-51) and `_out_processed_path` (merge.py:166).
+        #
+        # One divergence survives that fix: the dataset UNIONs the CWEs listed in owasptop10.xml /
+        # top25.xml into `_cwe_list` and hashes the union (dataset_lm.py:414-423), while
+        # `_out_processed_path` hashes the RAW cfg cwe_list. The two agree only while those XML
+        # files are absent — which is also why filter_owasp/filter_top25_dangerous currently
+        # filter nothing here. If they ever ship, merge would write a pool under a name the
+        # trainer cannot resolve and die rebuilding from raw CPG.
+        #
+        # So compare the two suffixes the way each side computes them TODAY, through the library's
+        # own helpers. Importing private helpers is safe here: pyproject pins gnn-vuln exactly, so
+        # they cannot drift without a deliberate pin bump.
+        #
+        # REVISIT AT 0.1.17: there `_out_processed_path` expands the XML sets too, so the merge
+        # side would also hash the union and this check would REJECT a config that actually works.
+        # The 0.1.17 migration requires dropping data.filter_owasp / data.filter_top25_dangerous
+        # first (missing XML becomes a hard FileNotFoundError there), and with both flags off the
+        # union collapses to the raw cwe_list and this check passes trivially — but delete it then
+        # rather than rely on that.
+        from gnn_vuln.data.dataset_lm import _filter_suffix, _get_cwe_set_from_xml
+
+        cwe_list = list(data_cfg.get("cwe_list") or [])
+        cwe_groups = data_cfg.get("cwe_groups") or None
+        fowasp = bool(data_cfg.get("filter_owasp"))
+        ftop25 = bool(data_cfg.get("filter_top25_dangerous"))
+
+        cwe_dir = Path(settings.data_root).parent / "data" / "cwe"
+        union = set(cwe_list)
+        if fowasp:
+            union |= _get_cwe_set_from_xml(cwe_dir / "owasptop10.xml")
+        if ftop25:
+            union |= _get_cwe_set_from_xml(cwe_dir / "top25.xml")
+
+        dataset_suffix = _filter_suffix(sorted(union) or None, cwe_groups, fowasp, ftop25)
+        merge_suffix = _filter_suffix(cwe_list or None, cwe_groups, fowasp, ftop25)
+        if dataset_suffix != merge_suffix:
             raise ValueError(
-                "cannot merge a cumulative replay pool for a config with data.cwe_list or "
-                "data.cwe_groups: gnn_vuln's merge ignores both when resolving the dataset name, "
-                "so the merged pool would be unreadable by the trainer. Send a single "
-                "replay_bundle_uri for this model, or drop the cwe_list/cwe_groups filter."
+                "cannot merge a cumulative replay pool for this config: the dataset resolves its "
+                f"name with filter suffix {dataset_suffix!r} (data.cwe_list UNIONed with the CWEs "
+                f"in {cwe_dir}/*.xml) while gnn_vuln's merge resolves {merge_suffix!r} (the raw "
+                "data.cwe_list), so the merged pool would be unreadable by the trainer. Send a "
+                "single replay_bundle_uri for this model, or drop data.filter_owasp / "
+                "data.filter_top25_dangerous so both sides agree."
             )
 
         # Mirror cfg's NAME-DETERMINING params exactly: merge resolves the output path via the same
