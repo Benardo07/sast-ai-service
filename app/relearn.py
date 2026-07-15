@@ -7,9 +7,12 @@ Ported and adapted from the original training repo. Key differences:
     The caller (sast-backend, the single source of truth) supplies the base
     checkpoint, the base config payload, and the data sources explicitly, and is
     responsible for persisting the resulting ModelVersion / metrics.
-  * Job state is kept in-memory + on disk under ``var/jobs/<job_id>/`` only so the
-    backend can poll ``GET /relearn/{job_id}`` for status, the new checkpoint, and
-    the training metrics.
+  * Job state lives on disk under ``var/jobs/<job_id>/``, which is the source of truth
+    ACROSS processes: the API and the Celery worker run in separate containers sharing
+    that directory as a volume, so only the file reflects a job's real progress. The
+    in-memory ``_jobs`` map is a per-process cache, valid only in the process that last
+    wrote it. The backend polls ``GET /relearn/{job_id}`` for status, the new
+    checkpoint, and the training metrics.
 
 Methods: finetune (base weights, no protection), EWC (EWC-DR penalty),
 ER (experience replay), EWC-ER (both), retrain (fresh weights, no base).
@@ -103,18 +106,31 @@ class RelearnManager:
         (d / "job.json").write_text(json.dumps(asdict(job), indent=2), encoding="utf-8")
 
     def get(self, job_id: str) -> RelearnJobState | None:
-        with self._lock:
-            if job_id in self._jobs:
-                return self._jobs[job_id]
-        # Fall back to disk (survives restart).
+        # Disk first, memory second — the order is load-bearing. The training runs in a
+        # SEPARATE Celery worker process (see run_job), and only that process calls _save
+        # once the job advances. This API process's _jobs entry is written once at submit
+        # time (see submit) and then freezes, so trusting memory first would report the
+        # submit-time status forever: the backend's poller would never see "done", the run
+        # would hang at "running" and its ModelVersion at "pending" until the poller gave
+        # up. Memory stays as the fallback for the window before job.json is written.
         path = self._job_dir(job_id) / "job.json"
         if path.exists():
-            data = json.loads(path.read_text(encoding="utf-8"))
-            return RelearnJobState(**data)
-        return None
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+                return RelearnJobState(**data)
+            except (OSError, ValueError, TypeError):
+                # Torn read (the worker is mid-write) or a schema drift: fall through to
+                # memory rather than 404 a job that exists.
+                pass
+        with self._lock:
+            return self._jobs.get(job_id)
 
     def list(self) -> list[RelearnJobState]:
+        # Same precedence as get(): disk wins over this process's memory, so seed the map
+        # from _jobs and let the on-disk state (written by the worker process) overwrite it.
         jobs: dict[str, RelearnJobState] = {}
+        with self._lock:
+            jobs.update(self._jobs)
         if settings.jobs_root.exists():
             for jp in settings.jobs_root.glob("*/job.json"):
                 try:
@@ -122,8 +138,6 @@ class RelearnManager:
                     jobs[data["job_id"]] = RelearnJobState(**data)
                 except Exception:  # noqa: BLE001
                     continue
-        with self._lock:
-            jobs.update(self._jobs)
         return sorted(jobs.values(), key=lambda j: j.created_at, reverse=True)
 
     # ── config generation (method -> ewc/replay blocks) ───────────────────
