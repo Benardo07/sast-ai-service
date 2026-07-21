@@ -935,6 +935,83 @@ class RelearnManager:
             "embedding_dim": (len(emb_list[0]) if emb_list else 0),
         }
 
+    @staticmethod
+    def _threshold_metrics(
+        results_dir: Path, class_names: list[str] | None, thresholds: list[float]
+    ) -> dict[str, dict] | None:
+        """Metrics at the confidence thresholds production actually deploys with.
+
+        The model predicts argmax over [benign, ...CWE]; a SAST finding is only surfaced when
+        `argmax != benign AND confidence >= t`. Macro-F1 over argmax therefore says nothing
+        about the operating point in use, and confidence calibration shifts between versions —
+        the same t can mean a very different false-positive rate two versions later, which is
+        invisible until a user complains.
+
+        Pure post-processing: the full eval already wrote per-sample (y_true, y_pred,
+        confidence) to predictions.csv for the drift baseline, so this costs one extra file
+        read and needs NO change to gnn_vuln. y_true/y_pred are class IDs (see the library's
+        EvalResult), hence the index comparison against benign.
+
+        Returns None when the inputs can't support the computation — no predictions.csv
+        (metrics-only run), no benign class in the vocab, or no usable rows — and never raises:
+        a reporting extra must not fail an evaluation."""
+        import csv
+
+        if not thresholds:
+            return None
+        pred_csv = next(results_dir.glob("**/predictions.csv"), None)
+        if pred_csv is None:
+            return None
+        # Threshold semantics are defined relative to "not benign"; without that class there is
+        # nothing to threshold against, so report nothing rather than guess an index.
+        names = list(class_names or [])
+        if "benign" not in names:
+            return None
+        benign_idx = names.index("benign")
+
+        rows: list[tuple[int, int, float]] = []
+        with open(pred_csv, newline="", encoding="utf-8") as f:
+            for row in csv.DictReader(f):
+                try:
+                    rows.append((int(row["y_true"]), int(row["y_pred"]), float(row["confidence"])))
+                except (KeyError, ValueError, TypeError):
+                    continue
+        if not rows:
+            return None
+
+        def _ratio(num: int, den: int) -> float | None:
+            # None, not 0.0: "no benign samples" is not "zero false positives".
+            return (num / den) if den else None
+
+        out: dict[str, dict] = {}
+        for t in thresholds:
+            tp = fp = fn = tn = cwe_hit = 0
+            for y_true, y_pred, conf in rows:
+                is_vuln = y_true != benign_idx
+                flagged = (y_pred != benign_idx) and (conf >= t)
+                if flagged and is_vuln:
+                    tp += 1
+                    if y_pred == y_true:
+                        cwe_hit += 1
+                elif flagged:
+                    fp += 1
+                elif is_vuln:
+                    fn += 1
+                else:
+                    tn += 1
+            n_vuln, n_benign, n_flagged = tp + fn, fp + tn, tp + fp
+            out[str(t)] = {
+                "threshold": t,
+                "fp_rate": _ratio(fp, n_benign),          # benign wrongly surfaced
+                "fn_rate": _ratio(fn, n_vuln),            # vulnerable held back by the threshold
+                "precision": _ratio(tp, n_flagged),       # of what we surfaced, truly vulnerable
+                "recall": _ratio(tp, n_vuln),             # = 1 - fn_rate
+                "cwe_accuracy": _ratio(cwe_hit, tp),      # of true findings, CWE type also right
+                "counts": {"tp": tp, "fp": fp, "fn": fn, "tn": tn,
+                           "n_vulnerable": n_vuln, "n_benign": n_benign, "n_flagged": n_flagged},
+            }
+        return out
+
     # ── evaluation (score an existing checkpoint on a held-out set) ─────────
     def evaluate_checkpoint(
         self,
@@ -945,6 +1022,7 @@ class RelearnManager:
         source: str | None = None,
         base_class_names: list[str] | None = None,
         device: str | None = None,
+        thresholds: list[float] | None = None,
     ) -> dict[str, Any]:
         """Run gnn_vuln.evaluate for one checkpoint over an inline CPG dataset used as a
         100% held-out test set. No training. Returns the metrics_summary. Synchronous —
@@ -1045,13 +1123,33 @@ class RelearnManager:
             baseline = self._read_baseline_from_artifacts(job_dir)
         except Exception:  # noqa: BLE001
             baseline = None
+        # Threshold-aware metrics from the SAME predictions.csv the baseline just used. Only
+        # when asked for, so the default response shape is unchanged. Best-effort like the
+        # baseline: a reporting extra must never fail the evaluation itself.
+        threshold_metrics = None
+        if thresholds:
+            try:
+                threshold_metrics = self._threshold_metrics(job_dir, class_names, thresholds)
+            except Exception:  # noqa: BLE001
+                threshold_metrics = None
+        metrics = self._scalar_metrics(data) if isinstance(data, dict) else {}
+        # num_samples must be the count actually SCORED, not the count SENT: materialization
+        # drops unparseable samples, so len(dataset) overstates it — that mismatch is why
+        # EvaluationRun.num_samples read wrong (e.g. 2) while the eval really scored 156. Prefer
+        # the evaluator's own test-sample count, fall back to the per-sample predictions the
+        # baseline read, then to sent-minus-dropped.
+        scored = metrics.get("function_level.num_test_samples")
+        if scored is None and baseline:
+            scored = baseline.get("num_samples")
+        num_samples = int(scored) if scored is not None else max(0, len(dataset) - dropped)
         return {
             "job_id": job_id,
             "checkpoint_path": checkpoint_path,
-            "metrics": self._scalar_metrics(data) if isinstance(data, dict) else {},
-            "num_samples": len(dataset),
+            "metrics": metrics,
+            "num_samples": num_samples,
             "num_dropped": dropped,
             "baseline": baseline,
+            "threshold_metrics": threshold_metrics,
         }
 
     def submit(

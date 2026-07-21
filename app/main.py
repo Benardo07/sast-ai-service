@@ -178,6 +178,7 @@ def evaluate_endpoint(body: EvaluateRequest) -> EvaluateResponse:
             source=body.source,
             base_class_names=body.base_class_names,
             device=body.device,
+            thresholds=body.thresholds,
         )
     except (ValueError, FileNotFoundError) as exc:
         raise HTTPException(status_code=422, detail=str(exc))

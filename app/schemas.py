@@ -127,6 +127,11 @@ class EvaluateRequest(BaseModel):
     source: str | None = Field(None, description="Name for the materialized eval dataset")
     base_class_names: list[str] | None = Field(None, description="Model's ordered class names for label alignment")
     device: str | None = None
+    # Confidence thresholds to also report metrics at. Production only surfaces a finding when
+    # argmax != benign AND confidence >= t, so argmax-only metrics never show how the model
+    # behaves at the threshold it is actually deployed with. Pure post-processing over the
+    # predictions the eval already writes — omit for the previous (argmax-only) behaviour.
+    thresholds: list[float] | None = Field(None, description="Confidence thresholds for threshold-aware metrics")
 
 
 class EvaluateResponse(BaseModel):
@@ -138,6 +143,10 @@ class EvaluateResponse(BaseModel):
     # Drift-baseline signals captured during the eval pass (per-sample confidence/error +
     # capped pre-head embeddings). None when the evaluator produced no sidecar.
     baseline: dict | None = None
+    # {"0.4": {"fp_rate": .., "fn_rate": .., "precision": .., "recall": .., "cwe_accuracy": ..}}
+    # None when no thresholds were requested (or predictions.csv had no usable rows). The
+    # argmax metrics above are returned unchanged either way, so comparisons stay stable.
+    threshold_metrics: dict[str, dict] | None = None
 
 
 class BuildCpgRequest(BaseModel):
