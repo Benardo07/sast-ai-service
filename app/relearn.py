@@ -164,6 +164,11 @@ class RelearnManager:
         cfg = copy.deepcopy(base_config)
         cfg.setdefault("data", {})
         cfg["data"]["source"] = data_source
+        # A base ConfigVersion can carry data.split_file — a path to another run's parquet-id
+        # list. gnn_vuln lets split_file OVERRIDE train_ratio/val_ratio (config.py: "split_file
+        # (explicit) overrides them"), so a carried-over value would silently replace the split we
+        # set below, taking the split from a different dataset with no error. Drop it. (T6)
+        cfg["data"].pop("split_file", None)
         if materialized:
             # Point gnn_vuln at the CPGs we just wrote under the service data root.
             cfg["data"]["raw_dir"] = str(settings.data_root / "raw")
@@ -215,7 +220,11 @@ class RelearnManager:
             if "val_ratio" in split:
                 cfg["data"]["val_ratio"] = split["val_ratio"]
             if "seed" in split:
-                cfg.setdefault("train", {})["seed"] = split["seed"]
+                # gnn_vuln has a dedicated data.split_seed that ONLY controls the split (it falls
+                # back to train.seed when empty). Writing to train.seed coupled the split to the
+                # training seed, so a re-run with a different training seed would also reshuffle
+                # the split. Target the split seed so the split stays reproducible. (T1)
+                cfg["data"]["split_seed"] = split["seed"]
 
         cfg.pop("ewc", None)
         cfg.pop("replay", None)
